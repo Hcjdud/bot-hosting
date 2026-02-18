@@ -1,5 +1,4 @@
-# Подключитесь к Render через консоль или обновите файл в репозитории
-echo "aiogram==2.25.1
+aiogram==2.25.1
 pyrogram==2.0.106
 tgcrypto==1.2.5
 aiohttp==3.8.6
@@ -10,4 +9,5 @@ psutil==5.9.6
 python-dotenv==1.0.0
 pytz==2024.1
 cryptography==42.0.5
-pycryptodome==3.20.0" > requirements.txt
+pycryptodome==3.20.0
+asyncio==3.4.3
