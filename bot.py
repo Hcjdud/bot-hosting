@@ -76,7 +76,7 @@ from aiohttp import web
 # ================= КОНФИГУРАЦИЯ =================
 
 # Данные бота
-BOT_TOKEN = "8594091933:AANoPyBEB71JyeAh-xRqH1Gx-jkFXynt3bu"
+BOT_TOKEN = "8594091933:AAHkRI8h_lDAEo0f-pzyNa4vEYguLF9iCRw"
 ADMIN_IDS = [8443743937]
 
 # ✅ API данные для Pyrogram (ваши)
