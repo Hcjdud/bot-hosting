@@ -57,7 +57,7 @@ from pyrogram.errors import FloodWait
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8594091933:AANoPyBEB71JyeAh-xRqH1Gx-jkFXynt3bu"
+BOT_TOKEN = "8594091933:AAFbO79jEjlF2vzTR6jYd3I-HotA1-hkziU"
 ADMIN_IDS = [8443743937]
 
 # API данные для Pyrogram (получить на my.telegram.org)
