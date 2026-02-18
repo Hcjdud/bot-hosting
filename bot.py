@@ -41,7 +41,8 @@ BASE_URL = os.environ.get('BASE_URL', f'http://localhost:{PORT}')
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 from aiogram.utils import executor
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -1017,29 +1018,26 @@ class AdminStates(StatesGroup):
 
 # ================= МИДЛВАРЬ ДЛЯ ТЕХРАБОТ =================
 
-class CancelHandler(Exception):
-    pass
-
-class MaintenanceMiddleware:
+class MaintenanceMiddleware(BaseMiddleware):
     """Мидлварь для проверки режима техработ"""
     
-    async def on_process_message(self, message: types.Message, data: dict):
+    async def on_process_message(self, message: Message, data: dict):
         if config.maintenance_mode:
             user_id = message.from_user.id
             if user_id not in ADMIN_IDS:
                 user = db.get_user(user_id)
                 if not user or not user.get('is_admin', 0):
                     await message.reply(config.maintenance_message)
-                    raise CancelHandler()
+                    return
     
-    async def on_process_callback_query(self, callback: types.CallbackQuery, data: dict):
+    async def on_process_callback_query(self, callback: CallbackQuery, data: dict):
         if config.maintenance_mode:
             user_id = callback.from_user.id
             if user_id not in ADMIN_IDS:
                 user = db.get_user(user_id)
                 if not user or not user.get('is_admin', 0):
                     await callback.answer(config.maintenance_message, show_alert=True)
-                    raise CancelHandler()
+                    return
 
 # Регистрируем мидлварь
 dp.middleware.setup(MaintenanceMiddleware())
