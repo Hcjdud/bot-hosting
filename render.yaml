@@ -1,22 +1,10 @@
-import os
-
-class Config:
-    # Токен бота
-    BOT_TOKEN = os.getenv("BOT_TOKEN", "8270979575:AAGK9BnLpi-wfFTnvziUMl1vj89YRAFbIjg")
-    
-    # ID администраторов
-    ADMIN_IDS = [int(id) for id in os.getenv("ADMIN_IDS", "8443743937").split(",") if id]
-    
-    # База данных
-    DATABASE_URL = os.getenv("DATABASE_URL", "")
-    REDIS_URL = os.getenv("REDIS_URL", "")
-    
-    # Настройки
-    DEBUG = False
-    MAX_BOTS_PER_USER = 5
-    
-    # Render
-    RENDER = os.getenv("RENDER", "False").lower() == "true"
-    PORT = int(os.getenv("PORT", 10000))
-
-config = Config()
+services:
+  - type: worker
+    name: telegram-shop-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: PORT
+        value: 8080
