@@ -1,6 +1,6 @@
-aiogram
-pyrogram
-tgcrypto
-aiohttp
-asyncio
-psutil
+aiogram==2.25.1
+pyrogram==2.0.106
+tgcrypto==1.2.5
+aiohttp==3.8.6
+asyncio==3.4.3
+psutil==5.9.6
