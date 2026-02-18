@@ -56,7 +56,7 @@ from pyrogram.errors import FloodWait
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
-BOT_TOKEN = "8594091933:AAHoPyBEB713yeAh-xRqHlGx-jkFXynt3bU"
+BOT_TOKEN = "8594091933:AANoPyBEB71JyeAh-xRqH1Gx-jkFXynt3bu"
 ADMIN_IDS = [8443743937]
 
 # API данные для Pyrogram (получить на my.telegram.org)
@@ -1017,6 +1017,9 @@ class AdminStates(StatesGroup):
 
 # ================= МИДЛВАРЬ ДЛЯ ТЕХРАБОТ =================
 
+class CancelHandler(Exception):
+    pass
+
 class MaintenanceMiddleware:
     """Мидлварь для проверки режима техработ"""
     
@@ -1037,6 +1040,9 @@ class MaintenanceMiddleware:
                 if not user or not user.get('is_admin', 0):
                     await callback.answer(config.maintenance_message, show_alert=True)
                     raise CancelHandler()
+
+# Регистрируем мидлварь
+dp.middleware.setup(MaintenanceMiddleware())
 
 # ================= КЛАВИАТУРЫ =================
 
@@ -1135,7 +1141,6 @@ def get_admin_keyboard():
     
     # Шестой ряд - технические работы (выделено)
     maintenance_status = "✅ Работает" if not config.maintenance_mode else "🔧 Включены"
-    maintenance_emoji = "🔧" if not config.maintenance_mode else "✅"
     keyboard.add(
         InlineKeyboardButton(f"🔧 Техработы: {maintenance_status}", callback_data="admin_toggle_maintenance"),
         InlineKeyboardButton("💾 Создать бекап", callback_data="admin_create_backup")
@@ -1152,7 +1157,7 @@ def get_number_manage_keyboard(number_id: int):
     keyboard.add(
         InlineKeyboardButton("✏️ Редактировать", callback_data=f"admin_edit_number_{number_id}"),
         InlineKeyboardButton("❌ Удалить", callback_data=f"admin_delete_number_{number_id}"),
-        InlineKeyboardButton("◀️ Назад", callback_data="admin_manage_numbers")
+        InlineKeyboardButton("◀️ Назад в список", callback_data="admin_all_numbers_page_1")
     )
     return keyboard
 
@@ -1165,7 +1170,7 @@ def get_edit_fields_keyboard(number_id: int):
         InlineKeyboardButton("📝 Описание", callback_data=f"edit_field_{number_id}_description"),
         InlineKeyboardButton("💰 Цена", callback_data=f"edit_field_{number_id}_price"),
         InlineKeyboardButton("🖼 Фото", callback_data=f"edit_field_{number_id}_photo"),
-        InlineKeyboardButton("◀️ Назад", callback_data=f"admin_view_number_{number_id}")
+        InlineKeyboardButton("◀️ Назад", callback_data=f"admin_edit_number_{number_id}")
     )
     return keyboard
 
@@ -1259,33 +1264,6 @@ async def cmd_start(message: types.Message):
             "👋 С возвращением!",
             reply_markup=get_main_keyboard(user_id)
         )
-
-# ================= МИДЛВАРЬ ДЛЯ ТЕХРАБОТ =================
-
-class CancelHandler(Exception):
-    pass
-
-@dp.middleware
-class MaintenanceMiddleware:
-    async def on_process_message(self, message: types.Message, data: dict):
-        if config.maintenance_mode:
-            user_id = message.from_user.id
-            if user_id not in ADMIN_IDS:
-                user = db.get_user(user_id)
-                if not user or not user.get('is_admin', 0):
-                    await message.reply(config.maintenance_message)
-                    raise CancelHandler()
-    
-    async def on_process_callback_query(self, callback: types.CallbackQuery, data: dict):
-        if config.maintenance_mode:
-            user_id = callback.from_user.id
-            if user_id not in ADMIN_IDS:
-                user = db.get_user(user_id)
-                if not user or not user.get('is_admin', 0):
-                    await callback.answer(config.maintenance_message, show_alert=True)
-                    raise CancelHandler()
-
-# ================= ОСНОВНЫЕ ОБРАБОТЧИКИ =================
 
 @dp.callback_query_handler(lambda c: c.data == 'main_menu')
 async def main_menu(callback: types.CallbackQuery):
@@ -3223,4 +3201,4 @@ if __name__ == "__main__":
         skip_updates=True,
         on_startup=on_startup,
         on_shutdown=on_shutdown
-    )
+)
