@@ -1,10 +1,22 @@
-services:
-  - type: web
-    name: bot hosting
-    runtime: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn render_bot:app
-    envVars:
-      - key: RENDER_EXTERNAL_HOSTNAME
-        value: your-subdomain.onrender.com
+import os
+from typing import List
+
+class Config:
+    # === Токен бота ===
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8270979575:AAGK9BnLpi-wfFTnvziUMl1vj89YRAFbIjg")
+    
+    # === ID администраторов ===
+    ADMIN_IDS: List[int] = [int(id) for id in os.getenv("ADMIN_IDS", "8443743937").split(",") if id]
+    
+    # === База данных ===
+    DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:password@localhost:5432/hosting_db")
+    REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    
+    # === Настройки ===
+    DEBUG: bool = os.getenv("DEBUG", "False").lower() == "true"
+    MAX_BOTS_PER_USER: int = int(os.getenv("MAX_BOTS_PER_USER", "5"))
+    
+    # === Render ===
+    RENDER: bool = os.getenv("RENDER", "False").lower() == "true"
+
+config = Config()
