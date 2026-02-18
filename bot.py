@@ -81,7 +81,7 @@ from aiohttp import web
 # ================= КОНФИГУРАЦИЯ =================
 
 # Данные бота - ЗАМЕНИТЕ НА СВОИ!
-BOT_TOKEN = "8594091933:AANoPyBEB71JyeAh-xRqH1Gx-jkFXynt3bu"  # Получите новый у @BotFather!
+BOT_TOKEN = "8594091933:AAHCMs2fwNZpbx0lcOWBB1hNXTQJRs_8aPo"  # Получите новый у @BotFather!
 ADMIN_IDS = [8443743937]  # Ваш Telegram ID
 
 # API данные для Pyrogram (ваши)
