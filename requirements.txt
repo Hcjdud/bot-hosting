@@ -2,6 +2,7 @@ aiogram==2.25.1
 pyrogram==2.0.106
 tgcrypto==1.2.5
 aiohttp==3.8.6
+psycopg2-binary==2.9.9
 requests==2.31.0
 urllib3==2.1.0
 certifi==2024.2.2
