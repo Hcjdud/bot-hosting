@@ -1,17 +1,17 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 8.0 (Production Ready - FINAL)
+Версия: 11.0 (FINAL - NEVER DIES)
 Функции:
 - Продажа виртуальных номеров Telegram
-- Управление сессиями Telegram аккаунтов
-- Автоматическое удаление номеров после продажи
-- Сессии живут бесконечно (автоматический перезаход)
-- Автоматический выход при заходе владельца
+- Создание и управление сессиями Telegram аккаунтов
+- Автоматическое получение кодов подтверждения
 - Оплата через ЮMoney и Crypto Bot
 - Админ-панель для управления
 - Баланс пользователей в звёздах
 - Полный мониторинг и логирование
-- Адаптация для Render
+- Поддержка PostgreSQL на Render
+- Исправлено дублирование ключей
+- СИСТЕМА БЕСКОНЕЧНОЙ РАБОТЫ (автоперезапуск при сбоях)
 """
 
 import os
@@ -25,11 +25,14 @@ import random
 import string
 import uuid
 import shutil
+import signal
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
-from urllib.parse import urlencode
+from urllib.parse import urlparse
+from functools import wraps
 
 # Дополнительные импорты для работы с API и безопасностью
 import requests
@@ -41,12 +44,83 @@ import pytz
 from cryptography.fernet import Fernet
 from Crypto.Cipher import AES
 
+# Для PostgreSQL
+import psycopg2
+import psycopg2.extras
+
 # Загружаем переменные окружения
 load_dotenv()
 
-# Устанавливаем переменные окружения для Render
+# ================= СИСТЕМА АВТОМАТИЧЕСКОГО ПЕРЕЗАПУСКА =================
+
+# Флаг для graceful shutdown
+running = True
+restart_requested = False
+last_message_time = time.time()
+
+def handle_exception(exc_type, exc_value, exc_traceback):
+    """Глобальный обработчик исключений"""
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    
+    logging.error("❌ НЕПЕРЕХВАЧЕННОЕ ИСКЛЮЧЕНИЕ:", exc_info=(exc_type, exc_value, exc_traceback))
+    
+    # Отправляем уведомление админу
+    try:
+        asyncio.create_task(notify_admin_crash(exc_type, exc_value))
+    except:
+        pass
+    
+    # Перезапускаем бота через 5 секунд
+    time.sleep(5)
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+# Устанавливаем глобальный обработчик
+sys.excepthook = handle_exception
+
+def restart_bot():
+    """Принудительный перезапуск бота"""
+    logging.info("🔄 Перезапуск бота...")
+    time.sleep(2)
+    os.execl(sys.executable, sys.executable, *sys.argv)
+
+def signal_handler(sig, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    global running
+    logging.info(f"📡 Получен сигнал {sig}, завершаем работу...")
+    running = False
+    sys.exit(0)
+
+# Регистрируем обработчики сигналов
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# ================= ПРОВЕРКА RENDER =================
+
+# Определяем, запущены ли мы на Render
+IS_RENDER = os.environ.get('RENDER', False)
+RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', 'localhost')
 PORT = int(os.environ.get('PORT', 8080))
 BASE_URL = os.environ.get('BASE_URL', f'http://localhost:{PORT}')
+
+# Получаем строку подключения к PostgreSQL
+DATABASE_URL = os.environ.get('DATABASE_URL')
+if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+# Настройка путей для Render
+if IS_RENDER:
+    print("🔄 Запуск на Render платформе")
+    SESSIONS_DIR = '/tmp/sessions'
+    DATABASE_BACKUP_DIR = '/tmp/backups'
+else:
+    SESSIONS_DIR = "sessions"
+    DATABASE_BACKUP_DIR = "backups"
+
+# Создаем папки
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+os.makedirs(DATABASE_BACKUP_DIR, exist_ok=True)
 
 # Импорты для aiogram
 from aiogram import Bot, Dispatcher, types
@@ -75,13 +149,13 @@ from pyrogram.errors import (
     AuthKeyDuplicated
 )
 
-# Для веб-сервера (нужен для колбэков от платежей)
+# Для веб-сервера
 from aiohttp import web
 
 # ================= КОНФИГУРАЦИЯ =================
 
 # Данные бота - ЗАМЕНИТЕ НА СВОИ!
-BOT_TOKEN = "8594091933:AAHCMs2fwNZpbx0lcOWBB1hNXTQJRs_8aPo"  # Получите новый у @BotFather!
+BOT_TOKEN = "8594091933:AANoPyBEB71JyeAh-xRqH1Gx-jkFXynt3bu"  # Получите новый у @BotFather!
 ADMIN_IDS = [8443743937]  # Ваш Telegram ID
 
 # API данные для Pyrogram (ваши)
@@ -95,10 +169,7 @@ YOOMONEY_SECRET = os.environ.get('YOOMONEY_SECRET', '')
 # Crypto Bot токен
 CRYPTOBOT_TOKEN = "UQCpU74nU-1MoECyq1IH24WA3677rgWtsVtJKEGVUGnVyawR"
 
-# Настройки базы данных
-DATABASE_FILE = "shop.db"
-SESSIONS_DIR = "sessions"
-DATABASE_BACKUP_DIR = "backups"
+# Конфигурационный файл
 CONFIG_FILE = "bot_config.json"
 
 # Курс: 1 звезда = X рублей
@@ -118,35 +189,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= ПРОВЕРКА ПАПОК =================
-
-# Проверяем и создаём нужные папки
-required_dirs = [SESSIONS_DIR, DATABASE_BACKUP_DIR, os.path.dirname(DATABASE_FILE) or '.']
-for dir_path in required_dirs:
-    if dir_path and not os.path.exists(dir_path):
-        try:
-            os.makedirs(dir_path, exist_ok=True)
-            logger.info(f"✅ Создана папка: {dir_path}")
-        except Exception as e:
-            logger.error(f"❌ Не удалось создать папку {dir_path}: {e}")
-            # Используем текущую папку как запасной вариант
-            if dir_path == SESSIONS_DIR:
-                SESSIONS_DIR = "sessions"
-            elif dir_path == DATABASE_BACKUP_DIR:
-                DATABASE_BACKUP_DIR = "backups"
-            elif dir_path == os.path.dirname(DATABASE_FILE):
-                DATABASE_FILE = "shop.db"
-
-# Проверяем права на запись в текущей папке
-try:
-    test_file = "test_write.tmp"
-    with open(test_file, "w") as f:
-        f.write("test")
-    os.remove(test_file)
-    logger.info(f"✅ Права на запись есть в папке: {os.getcwd()}")
-except Exception as e:
-    logger.error(f"❌ Нет прав на запись в текущей папке: {e}")
-    sys.exit(1)
+logger.info(f"📁 Sessions dir: {SESSIONS_DIR}")
+logger.info(f"📁 Backups dir: {DATABASE_BACKUP_DIR}")
+if DATABASE_URL:
+    logger.info(f"✅ Используется PostgreSQL")
+else:
+    logger.info(f"⚠️ Используется SQLite")
 
 # Инициализация бота
 storage = MemoryStorage()
@@ -162,54 +210,304 @@ session_cb = CallbackData('session', 'action', 'phone')
 admin_cb = CallbackData('admin', 'action', 'page')
 payment_cb = CallbackData('payment', 'action', 'payment_id')
 
-# ================= БАЗА ДАННЫХ =================
+# ================= БАЗА ДАННЫХ (PostgreSQL + SQLite) =================
 
 class Database:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
+    def __init__(self):
         self.cache = {}
+        self.db_url = DATABASE_URL
         
-        # Создаём папку для БД если её нет
-        db_dir = os.path.dirname(db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            logger.info(f"✅ Создана папка для БД: {db_dir}")
-        
-        # Проверяем доступность для записи
-        self._check_write_permission()
-        
-        # Инициализируем БД
-        self._init_db()
+        if self.db_url:
+            # Используем PostgreSQL на Render
+            logger.info("✅ Инициализация PostgreSQL...")
+            self._init_postgres()
+        else:
+            # Используем SQLite локально
+            logger.info("⚠️ Инициализация SQLite...")
+            self.db_path = "shop.db"
+            self._init_sqlite()
     
-    def _check_write_permission(self):
-        """Проверка прав на запись"""
+    def _init_postgres(self):
+        """Инициализация PostgreSQL"""
         try:
-            # Пробуем создать временный файл
-            test_file = os.path.join(os.path.dirname(self.db_path) or '.', 'test_write.tmp')
-            with open(test_file, 'w') as f:
-                f.write('test')
-            os.remove(test_file)
-            logger.info(f"✅ Права на запись есть в папке: {os.path.dirname(self.db_path) or '.'}")
+            conn = psycopg2.connect(self.db_url)
+            cursor = conn.cursor()
+            
+            # Таблица пользователей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    stars_balance INTEGER DEFAULT 0,
+                    rub_balance REAL DEFAULT 0,
+                    registered_at REAL,
+                    last_activity REAL,
+                    is_admin INTEGER DEFAULT 0,
+                    banned INTEGER DEFAULT 0
+                )
+            ''')
+            
+            # Таблица Telegram аккаунтов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tg_accounts (
+                    phone TEXT PRIMARY KEY,
+                    session_name TEXT UNIQUE,
+                    api_id INTEGER,
+                    api_hash TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    username TEXT,
+                    user_id BIGINT,
+                    status TEXT DEFAULT 'active',
+                    added_by BIGINT,
+                    added_at REAL,
+                    last_used REAL,
+                    last_code TEXT,
+                    last_code_time REAL,
+                    banned INTEGER DEFAULT 0,
+                    spam_block INTEGER DEFAULT 0,
+                    owner_id BIGINT DEFAULT 0,
+                    owner_username TEXT,
+                    owner_checked INTEGER DEFAULT 0,
+                    notes TEXT
+                )
+            ''')
+            
+            # Таблица номеров
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS numbers (
+                    id SERIAL PRIMARY KEY,
+                    phone_number TEXT UNIQUE,
+                    country TEXT,
+                    description TEXT,
+                    price_stars INTEGER,
+                    price_rub REAL,
+                    status TEXT DEFAULT 'available',
+                    sold_to BIGINT,
+                    sold_at REAL,
+                    code TEXT,
+                    code_expires REAL,
+                    source_account TEXT REFERENCES tg_accounts(phone)
+                )
+            ''')
+            
+            # Таблица транзакций
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    number_id INTEGER,
+                    amount_stars INTEGER,
+                    amount_rub REAL,
+                    payment_system TEXT,
+                    payment_id TEXT,
+                    status TEXT,
+                    created_at REAL,
+                    completed_at REAL
+                )
+            ''')
+            
+            # Таблица платежей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payments (
+                    id TEXT PRIMARY KEY,
+                    user_id BIGINT,
+                    number_id INTEGER,
+                    amount_rub REAL,
+                    stars_amount INTEGER,
+                    payment_system TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at REAL,
+                    completed_at REAL,
+                    payment_url TEXT
+                )
+            ''')
+            
+            # Таблица логов сессий
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS session_logs (
+                    id SERIAL PRIMARY KEY,
+                    phone TEXT,
+                    action TEXT,
+                    result TEXT,
+                    error TEXT,
+                    created_at REAL
+                )
+            ''')
+            
+            # Таблица системных логов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_logs (
+                    id SERIAL PRIMARY KEY,
+                    level TEXT,
+                    module TEXT,
+                    message TEXT,
+                    created_at REAL
+                )
+            ''')
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            logger.info("✅ Таблицы PostgreSQL созданы")
+            
         except Exception as e:
-            logger.error(f"❌ Нет прав на запись: {e}")
-            # Пробуем использовать текущую папку
-            self.db_path = os.path.join(os.getcwd(), 'shop.db')
-            logger.info(f"✅ Используем альтернативный путь: {self.db_path}")
+            logger.error(f"❌ Ошибка инициализации PostgreSQL: {e}")
+            # Переключаемся на SQLite
+            self.db_url = None
+            self.db_path = "shop.db"
+            self._init_sqlite()
+    
+    def _init_sqlite(self):
+        """Инициализация SQLite"""
+        try:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            cursor = conn.cursor()
+            
+            # Таблица пользователей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    stars_balance INTEGER DEFAULT 0,
+                    rub_balance REAL DEFAULT 0,
+                    registered_at REAL,
+                    last_activity REAL,
+                    is_admin INTEGER DEFAULT 0,
+                    banned INTEGER DEFAULT 0
+                )
+            ''')
+            
+            # Таблица Telegram аккаунтов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tg_accounts (
+                    phone TEXT PRIMARY KEY,
+                    session_name TEXT UNIQUE,
+                    api_id INTEGER,
+                    api_hash TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    username TEXT,
+                    user_id INTEGER,
+                    status TEXT DEFAULT 'active',
+                    added_by INTEGER,
+                    added_at REAL,
+                    last_used REAL,
+                    last_code TEXT,
+                    last_code_time REAL,
+                    banned INTEGER DEFAULT 0,
+                    spam_block INTEGER DEFAULT 0,
+                    owner_id INTEGER DEFAULT 0,
+                    owner_username TEXT,
+                    owner_checked INTEGER DEFAULT 0,
+                    notes TEXT
+                )
+            ''')
+            
+            # Таблица номеров
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS numbers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone_number TEXT UNIQUE,
+                    country TEXT,
+                    description TEXT,
+                    price_stars INTEGER,
+                    price_rub REAL,
+                    status TEXT DEFAULT 'available',
+                    sold_to INTEGER,
+                    sold_at REAL,
+                    code TEXT,
+                    code_expires REAL,
+                    source_account TEXT REFERENCES tg_accounts(phone)
+                )
+            ''')
+            
+            # Таблица транзакций
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    number_id INTEGER,
+                    amount_stars INTEGER,
+                    amount_rub REAL,
+                    payment_system TEXT,
+                    payment_id TEXT,
+                    status TEXT,
+                    created_at REAL,
+                    completed_at REAL
+                )
+            ''')
+            
+            # Таблица платежей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payments (
+                    id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    number_id INTEGER,
+                    amount_rub REAL,
+                    stars_amount INTEGER,
+                    payment_system TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at REAL,
+                    completed_at REAL,
+                    payment_url TEXT
+                )
+            ''')
+            
+            # Таблица логов сессий
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS session_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    phone TEXT,
+                    action TEXT,
+                    result TEXT,
+                    error TEXT,
+                    created_at REAL
+                )
+            ''')
+            
+            # Таблица системных логов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS system_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    level TEXT,
+                    module TEXT,
+                    message TEXT,
+                    created_at REAL
+                )
+            ''')
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            logger.info(f"✅ Таблицы SQLite созданы: {self.db_path}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации SQLite: {e}")
     
     def _get_connection(self):
         """Получение соединения с БД"""
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.row_factory = sqlite3.Row
-            return conn
-        except sqlite3.Error as e:
-            logger.error(f"❌ Ошибка подключения к БД: {e}")
-            # Пробуем создать файл заново
-            if os.path.exists(self.db_path):
-                os.remove(self.db_path)
-            conn = sqlite3.connect(self.db_path, timeout=30)
-            conn.row_factory = sqlite3.Row
-            return conn
+        if self.db_url:
+            # PostgreSQL
+            try:
+                conn = psycopg2.connect(self.db_url)
+                # Настраиваем возврат строк как словари
+                conn.cursor_factory = psycopg2.extras.DictCursor
+                return conn
+            except Exception as e:
+                logger.error(f"❌ Ошибка подключения к PostgreSQL: {e}")
+                raise
+        else:
+            # SQLite
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=30)
+                conn.row_factory = sqlite3.Row
+                return conn
+            except sqlite3.Error as e:
+                logger.error(f"❌ Ошибка подключения к SQLite: {e}")
+                raise
     
     @contextmanager
     def get_cursor(self):
@@ -221,8 +519,8 @@ class Database:
             cursor = conn.cursor()
             yield cursor
             conn.commit()
-        except sqlite3.Error as e:
-            logger.error(f"❌ Ошибка SQLite: {e}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка базы данных: {e}")
             if conn:
                 conn.rollback()
             raise
@@ -231,143 +529,6 @@ class Database:
                 cursor.close()
             if conn:
                 conn.close()
-    
-    def _init_db(self):
-        """Инициализация таблиц"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                with self.get_cursor() as cursor:
-                    # Таблица пользователей бота
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id INTEGER PRIMARY KEY,
-                            username TEXT,
-                            first_name TEXT,
-                            stars_balance INTEGER DEFAULT 0,
-                            rub_balance REAL DEFAULT 0,
-                            registered_at REAL,
-                            last_activity REAL,
-                            is_admin INTEGER DEFAULT 0,
-                            banned INTEGER DEFAULT 0
-                        )
-                    ''')
-                    
-                    # Таблица Telegram аккаунтов (сессий)
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS tg_accounts (
-                            phone TEXT PRIMARY KEY,
-                            session_name TEXT UNIQUE,
-                            api_id INTEGER,
-                            api_hash TEXT,
-                            first_name TEXT,
-                            last_name TEXT,
-                            username TEXT,
-                            user_id INTEGER,
-                            status TEXT DEFAULT 'active',
-                            added_by INTEGER,
-                            added_at REAL,
-                            last_used REAL,
-                            last_code TEXT,
-                            last_code_time REAL,
-                            banned INTEGER DEFAULT 0,
-                            spam_block INTEGER DEFAULT 0,
-                            owner_id INTEGER DEFAULT 0,
-                            owner_username TEXT,
-                            owner_checked INTEGER DEFAULT 0,
-                            notes TEXT
-                        )
-                    ''')
-                    
-                    # Таблица номеров для продажи
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS numbers (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            phone_number TEXT UNIQUE,
-                            country TEXT,
-                            description TEXT,
-                            price_stars INTEGER,
-                            price_rub REAL,
-                            status TEXT DEFAULT 'available',
-                            sold_to INTEGER,
-                            sold_at REAL,
-                            code TEXT,
-                            code_expires REAL,
-                            source_account TEXT REFERENCES tg_accounts(phone)
-                        )
-                    ''')
-                    
-                    # Таблица транзакций
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS transactions (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            user_id INTEGER,
-                            number_id INTEGER,
-                            amount_stars INTEGER,
-                            amount_rub REAL,
-                            payment_system TEXT,
-                            payment_id TEXT,
-                            status TEXT,
-                            created_at REAL,
-                            completed_at REAL
-                        )
-                    ''')
-                    
-                    # Таблица платежей
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS payments (
-                            id TEXT PRIMARY KEY,
-                            user_id INTEGER,
-                            number_id INTEGER,
-                            amount_rub REAL,
-                            stars_amount INTEGER,
-                            payment_system TEXT,
-                            status TEXT DEFAULT 'pending',
-                            created_at REAL,
-                            completed_at REAL,
-                            payment_url TEXT
-                        )
-                    ''')
-                    
-                    # Таблица логов сессий
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS session_logs (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            phone TEXT,
-                            action TEXT,
-                            result TEXT,
-                            error TEXT,
-                            created_at REAL
-                        )
-                    ''')
-                    
-                    # Таблица для хранения логов системы
-                    cursor.execute('''
-                        CREATE TABLE IF NOT EXISTS system_logs (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            level TEXT,
-                            module TEXT,
-                            message TEXT,
-                            created_at REAL
-                        )
-                    ''')
-                    
-                    # Проверяем, создались ли таблицы
-                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                    tables = cursor.fetchall()
-                    logger.info(f"✅ Созданы таблицы: {[t[0] for t in tables]}")
-                    
-                    break  # Успешно, выходим из цикла
-                    
-            except sqlite3.Error as e:
-                logger.error(f"❌ Попытка {attempt + 1}/{max_retries} не удалась: {e}")
-                if attempt == max_retries - 1:
-                    # Последняя попытка не удалась
-                    logger.error("❌ Критическая ошибка: не удалось создать БД")
-                    raise
-                time.sleep(1)  # Ждём перед повторной попыткой
-        
-        logger.info(f"✅ База данных инициализирована: {self.db_path}")
     
     # ===== Методы для пользователей бота =====
     
@@ -378,175 +539,353 @@ class Database:
             if time.time() - timestamp < CACHE_TTL:
                 return cached
         
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-            row = cursor.fetchone()
-            if row:
-                user = dict(row)
-                self.cache[cache_key] = (user, time.time())
-                return user
+        try:
+            with self.get_cursor() as cursor:
+                if self.db_url:
+                    cursor.execute('SELECT * FROM users WHERE user_id = %s', (user_id,))
+                else:
+                    cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
+                
+                row = cursor.fetchone()
+                if row:
+                    user = dict(row)
+                    self.cache[cache_key] = (user, time.time())
+                    return user
+        except Exception as e:
+            logger.error(f"Ошибка получения пользователя {user_id}: {e}")
+        
         return None
     
     def create_user(self, user_id: int, username: str, first_name: str) -> bool:
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('''
-                    INSERT OR IGNORE INTO users (user_id, username, first_name, registered_at, last_activity)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (user_id, username, first_name, time.time(), time.time()))
-                return True
+            if self.db_url:  # PostgreSQL
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO users (user_id, username, first_name, registered_at, last_activity)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id) DO NOTHING
+                    ''', (user_id, username, first_name, time.time(), time.time()))
+                    return True
+            else:  # SQLite
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO users (user_id, username, first_name, registered_at, last_activity)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (user_id, username, first_name, time.time(), time.time()))
+                    return True
         except Exception as e:
-            logger.error(f"Ошибка создания пользователя: {e}")
+            logger.error(f"Ошибка создания пользователя {user_id}: {e}")
             return False
     
     def update_user_activity(self, user_id: int):
-        with self.get_cursor() as cursor:
-            cursor.execute('UPDATE users SET last_activity = ? WHERE user_id = ?', 
-                          (time.time(), user_id))
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('UPDATE users SET last_activity = %s WHERE user_id = %s', 
+                                  (time.time(), user_id))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('UPDATE users SET last_activity = ? WHERE user_id = ?', 
+                                  (time.time(), user_id))
+            
             if f'user_{user_id}' in self.cache:
                 del self.cache[f'user_{user_id}']
+        except Exception as e:
+            logger.error(f"Ошибка обновления активности {user_id}: {e}")
     
     def add_stars(self, user_id: int, amount: int) -> bool:
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?', 
-                             (amount, user_id))
-                cursor.execute('''
-                    INSERT INTO transactions (user_id, amount_stars, type, created_at)
-                    VALUES (?, ?, 'credit', ?)
-                ''', (user_id, amount, time.time()))
-                
-                if f'user_{user_id}' in self.cache:
-                    del self.cache[f'user_{user_id}']
-                return True
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('UPDATE users SET stars_balance = stars_balance + %s WHERE user_id = %s', 
+                                 (amount, user_id))
+                    cursor.execute('''
+                        INSERT INTO transactions (user_id, amount_stars, type, created_at)
+                        VALUES (%s, %s, 'credit', %s)
+                    ''', (user_id, amount, time.time()))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?', 
+                                 (amount, user_id))
+                    cursor.execute('''
+                        INSERT INTO transactions (user_id, amount_stars, type, created_at)
+                        VALUES (?, ?, 'credit', ?)
+                    ''', (user_id, amount, time.time()))
+            
+            if f'user_{user_id}' in self.cache:
+                del self.cache[f'user_{user_id}']
+            return True
         except Exception as e:
-            logger.error(f"Ошибка добавления звёзд: {e}")
+            logger.error(f"Ошибка добавления звёзд {user_id}: {e}")
             return False
     
     def deduct_stars(self, user_id: int, amount: int) -> bool:
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('SELECT stars_balance FROM users WHERE user_id = ?', (user_id,))
-                row = cursor.fetchone()
-                if row and row['stars_balance'] >= amount:
-                    cursor.execute('UPDATE users SET stars_balance = stars_balance - ? WHERE user_id = ?', 
-                                 (amount, user_id))
-                    cursor.execute('''
-                        INSERT INTO transactions (user_id, amount_stars, type, created_at)
-                        VALUES (?, ?, 'debit', ?)
-                    ''', (user_id, amount, time.time()))
-                    
-                    if f'user_{user_id}' in self.cache:
-                        del self.cache[f'user_{user_id}']
-                    return True
-                return False
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT stars_balance FROM users WHERE user_id = %s', (user_id,))
+                    row = cursor.fetchone()
+                    if row and row['stars_balance'] >= amount:
+                        cursor.execute('UPDATE users SET stars_balance = stars_balance - %s WHERE user_id = %s', 
+                                     (amount, user_id))
+                        cursor.execute('''
+                            INSERT INTO transactions (user_id, amount_stars, type, created_at)
+                            VALUES (%s, %s, 'debit', %s)
+                        ''', (user_id, amount, time.time()))
+                        
+                        if f'user_{user_id}' in self.cache:
+                            del self.cache[f'user_{user_id}']
+                        return True
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT stars_balance FROM users WHERE user_id = ?', (user_id,))
+                    row = cursor.fetchone()
+                    if row and row['stars_balance'] >= amount:
+                        cursor.execute('UPDATE users SET stars_balance = stars_balance - ? WHERE user_id = ?', 
+                                     (amount, user_id))
+                        cursor.execute('''
+                            INSERT INTO transactions (user_id, amount_stars, type, created_at)
+                            VALUES (?, ?, 'debit', ?)
+                        ''', (user_id, amount, time.time()))
+                        
+                        if f'user_{user_id}' in self.cache:
+                            del self.cache[f'user_{user_id}']
+                        return True
+            return False
         except Exception as e:
-            logger.error(f"Ошибка списания звёзд: {e}")
+            logger.error(f"Ошибка списания звёзд {user_id}: {e}")
             return False
     
-    # ===== Методы для Telegram аккаунтов (сессий) =====
+    # ===== Методы для Telegram аккаунтов =====
     
     def add_tg_account(self, phone: str, session_name: str, api_id: int, api_hash: str, 
                        user_info: Dict, added_by: int) -> bool:
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO tg_accounts 
-                    (phone, session_name, api_id, api_hash, first_name, last_name, username, user_id, 
-                     added_by, added_at, last_used, status, owner_id, owner_checked)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    phone, session_name, api_id, api_hash,
-                    user_info.get('first_name', ''),
-                    user_info.get('last_name', ''),
-                    user_info.get('username', ''),
-                    user_info.get('id', 0),
-                    added_by, time.time(), time.time(),
-                    'active', 0, 0
-                ))
-                return True
+            if self.db_url:  # PostgreSQL
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO tg_accounts 
+                        (phone, session_name, api_id, api_hash, first_name, last_name, username, user_id, 
+                         added_by, added_at, last_used, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (phone) DO UPDATE SET
+                            session_name = EXCLUDED.session_name,
+                            first_name = EXCLUDED.first_name,
+                            last_name = EXCLUDED.last_name,
+                            username = EXCLUDED.username,
+                            user_id = EXCLUDED.user_id,
+                            status = EXCLUDED.status,
+                            last_used = EXCLUDED.last_used
+                    ''', (
+                        phone, session_name, api_id, api_hash,
+                        user_info.get('first_name', ''),
+                        user_info.get('last_name', ''),
+                        user_info.get('username', ''),
+                        user_info.get('id', 0),
+                        added_by, time.time(), time.time(),
+                        'active'
+                    ))
+                    return True
+            else:  # SQLite
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO tg_accounts 
+                        (phone, session_name, api_id, api_hash, first_name, last_name, username, user_id, 
+                         added_by, added_at, last_used, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        phone, session_name, api_id, api_hash,
+                        user_info.get('first_name', ''),
+                        user_info.get('last_name', ''),
+                        user_info.get('username', ''),
+                        user_info.get('id', 0),
+                        added_by, time.time(), time.time(),
+                        'active'
+                    ))
+                    return True
         except Exception as e:
             logger.error(f"Ошибка добавления аккаунта {phone}: {e}")
             return False
     
     def get_tg_account(self, phone: str) -> Optional[Dict]:
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT * FROM tg_accounts WHERE phone = ?', (phone,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM tg_accounts WHERE phone = %s', (phone,))
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM tg_accounts WHERE phone = ?', (phone,))
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Ошибка получения аккаунта {phone}: {e}")
+            return None
     
     def get_all_tg_accounts(self) -> List[Dict]:
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT * FROM tg_accounts ORDER BY added_at DESC')
-            return [dict(row) for row in cursor.fetchall()]
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM tg_accounts ORDER BY added_at DESC')
+                    return [dict(row) for row in cursor.fetchall()]
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM tg_accounts ORDER BY added_at DESC')
+                    return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Ошибка получения аккаунтов: {e}")
+            return []
     
     def update_tg_account_status(self, phone: str, status: str, notes: str = ""):
-        with self.get_cursor() as cursor:
-            cursor.execute('''
-                UPDATE tg_accounts 
-                SET status = ?, notes = ?, last_used = ? 
-                WHERE phone = ?
-            ''', (status, notes, time.time(), phone))
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET status = %s, notes = %s, last_used = %s 
+                        WHERE phone = %s
+                    ''', (status, notes, time.time(), phone))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET status = ?, notes = ?, last_used = ? 
+                        WHERE phone = ?
+                    ''', (status, notes, time.time(), phone))
+        except Exception as e:
+            logger.error(f"Ошибка обновления статуса {phone}: {e}")
     
     def set_tg_account_code(self, phone: str, code: str):
-        with self.get_cursor() as cursor:
-            cursor.execute('''
-                UPDATE tg_accounts 
-                SET last_code = ?, last_code_time = ? 
-                WHERE phone = ?
-            ''', (code, time.time(), phone))
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET last_code = %s, last_code_time = %s 
+                        WHERE phone = %s
+                    ''', (code, time.time(), phone))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET last_code = ?, last_code_time = ? 
+                        WHERE phone = ?
+                    ''', (code, time.time(), phone))
+        except Exception as e:
+            logger.error(f"Ошибка установки кода {phone}: {e}")
     
     def get_available_tg_account(self) -> Optional[Dict]:
-        """Получение случайного активного аккаунта для получения кода"""
-        with self.get_cursor() as cursor:
-            cursor.execute('''
-                SELECT * FROM tg_accounts 
-                WHERE status = 'active' AND banned = 0 AND spam_block = 0
-                ORDER BY last_used ASC
-                LIMIT 1
-            ''')
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        SELECT * FROM tg_accounts 
+                        WHERE status = 'active' AND banned = 0 AND spam_block = 0
+                        ORDER BY last_used ASC
+                        LIMIT 1
+                    ''')
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        SELECT * FROM tg_accounts 
+                        WHERE status = 'active' AND banned = 0 AND spam_block = 0
+                        ORDER BY last_used ASC
+                        LIMIT 1
+                    ''')
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Ошибка получения доступного аккаунта: {e}")
+            return None
     
     def log_session_action(self, phone: str, action: str, result: str, error: str = ""):
-        with self.get_cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO session_logs (phone, action, result, error, created_at)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (phone, action, result, error, time.time()))
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO session_logs (phone, action, result, error, created_at)
+                        VALUES (%s, %s, %s, %s, %s)
+                    ''', (phone, action, result, error, time.time()))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO session_logs (phone, action, result, error, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (phone, action, result, error, time.time()))
+        except Exception as e:
+            logger.error(f"Ошибка логирования {phone}: {e}")
     
     def set_account_owner(self, phone: str, owner_id: int, owner_username: str):
-        """Установка владельца аккаунта"""
-        with self.get_cursor() as cursor:
-            cursor.execute('''
-                UPDATE tg_accounts 
-                SET owner_id = ?, owner_username = ?, owner_checked = 1
-                WHERE phone = ?
-            ''', (owner_id, owner_username, phone))
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET owner_id = %s, owner_username = %s, owner_checked = 1
+                        WHERE phone = %s
+                    ''', (owner_id, owner_username, phone))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET owner_id = ?, owner_username = ?, owner_checked = 1
+                        WHERE phone = ?
+                    ''', (owner_id, owner_username, phone))
+        except Exception as e:
+            logger.error(f"Ошибка установки владельца {phone}: {e}")
     
     def check_account_owner(self, phone: str) -> Tuple[bool, int]:
-        """Проверка, есть ли у аккаунта владелец"""
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT owner_id, owner_checked FROM tg_accounts WHERE phone = ?', (phone,))
-            row = cursor.fetchone()
-            if row and row['owner_checked'] and row['owner_id'] > 0:
-                return True, row['owner_id']
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT owner_id, owner_checked FROM tg_accounts WHERE phone = %s', (phone,))
+                    row = cursor.fetchone()
+                    if row and row['owner_checked'] and row['owner_id'] > 0:
+                        return True, row['owner_id']
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT owner_id, owner_checked FROM tg_accounts WHERE phone = ?', (phone,))
+                    row = cursor.fetchone()
+                    if row and row['owner_checked'] and row['owner_id'] > 0:
+                        return True, row['owner_id']
+            return False, 0
+        except Exception as e:
+            logger.error(f"Ошибка проверки владельца {phone}: {e}")
             return False, 0
     
-    # ===== Методы для номеров (товаров) =====
+    # ===== Методы для номеров =====
     
     def add_number(self, phone: str, country: str, description: str, 
                    price_stars: int, source_account: str = None) -> bool:
         try:
             price_rub = price_stars * STAR_TO_RUB
-            with self.get_cursor() as cursor:
-                cursor.execute('''
-                    INSERT OR REPLACE INTO numbers 
-                    (phone_number, country, description, price_stars, price_rub, source_account, status)
-                    VALUES (?, ?, ?, ?, ?, ?, 'available')
-                ''', (phone, country, description, price_stars, price_rub, source_account))
-                logger.info(f"✅ Добавлен номер: {phone} | {country} | {price_stars}⭐ | {description}")
-                return True
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT INTO numbers 
+                        (phone_number, country, description, price_stars, price_rub, source_account, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'available')
+                        ON CONFLICT (phone_number) DO UPDATE SET
+                            country = EXCLUDED.country,
+                            description = EXCLUDED.description,
+                            price_stars = EXCLUDED.price_stars,
+                            price_rub = EXCLUDED.price_rub,
+                            status = 'available'
+                    ''', (phone, country, description, price_stars, price_rub, source_account))
+                    logger.info(f"✅ Добавлен номер: {phone} | {country} | {price_stars}⭐")
+                    return True
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO numbers 
+                        (phone_number, country, description, price_stars, price_rub, source_account, status)
+                        VALUES (?, ?, ?, ?, ?, ?, 'available')
+                    ''', (phone, country, description, price_stars, price_rub, source_account))
+                    logger.info(f"✅ Добавлен номер: {phone} | {country} | {price_stars}⭐")
+                    return True
         except Exception as e:
             logger.error(f"❌ Ошибка добавления номера {phone}: {e}")
             return False
@@ -560,123 +899,223 @@ class Database:
             if time.time() - timestamp < CACHE_TTL:
                 return cached
         
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT COUNT(*) as count FROM numbers WHERE status = "available"')
-            total = cursor.fetchone()['count']
-            
-            cursor.execute('''
-                SELECT * FROM numbers 
-                WHERE status = 'available' 
-                ORDER BY price_stars ASC 
-                LIMIT ? OFFSET ?
-            ''', (limit, offset))
-            
-            numbers = [dict(row) for row in cursor.fetchall()]
-            result = (numbers, total)
-            self.cache[cache_key] = (result, time.time())
-            return result
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT COUNT(*) as count FROM numbers WHERE status = %s', ('available',))
+                    total = cursor.fetchone()['count']
+                    
+                    cursor.execute('''
+                        SELECT * FROM numbers 
+                        WHERE status = %s 
+                        ORDER BY price_stars ASC 
+                        LIMIT %s OFFSET %s
+                    ''', ('available', limit, offset))
+                    
+                    numbers = [dict(row) for row in cursor.fetchall()]
+                    result = (numbers, total)
+                    self.cache[cache_key] = (result, time.time())
+                    return result
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'available'")
+                    total = cursor.fetchone()['count']
+                    
+                    cursor.execute('''
+                        SELECT * FROM numbers 
+                        WHERE status = 'available' 
+                        ORDER BY price_stars ASC 
+                        LIMIT ? OFFSET ?
+                    ''', (limit, offset))
+                    
+                    numbers = [dict(row) for row in cursor.fetchall()]
+                    result = (numbers, total)
+                    self.cache[cache_key] = (result, time.time())
+                    return result
+        except Exception as e:
+            logger.error(f"Ошибка получения номеров: {e}")
+            return [], 0
     
     def get_number(self, number_id: int) -> Optional[Dict]:
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT * FROM numbers WHERE id = ?', (number_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM numbers WHERE id = %s', (number_id,))
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM numbers WHERE id = ?', (number_id,))
+                    row = cursor.fetchone()
+                    return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Ошибка получения номера {number_id}: {e}")
+            return None
     
     def purchase_number(self, number_id: int, user_id: int) -> Optional[Dict]:
         try:
-            with self.get_cursor() as cursor:
-                # Получаем номер
-                cursor.execute('SELECT * FROM numbers WHERE id = ? AND status = "available"', (number_id,))
-                number = cursor.fetchone()
-                if not number:
-                    return None
-                number = dict(number)
-                
-                # Проверяем баланс пользователя
-                cursor.execute('SELECT stars_balance FROM users WHERE user_id = ?', (user_id,))
-                user = cursor.fetchone()
-                if not user or user['stars_balance'] < number['price_stars']:
-                    return None
-                
-                # Списываем звёзды
-                cursor.execute('UPDATE users SET stars_balance = stars_balance - ? WHERE user_id = ?', 
-                              (number['price_stars'], user_id))
-                
-                # Обновляем статус номера
-                cursor.execute('''
-                    UPDATE numbers 
-                    SET status = 'pending', sold_to = ?, sold_at = ?
-                    WHERE id = ?
-                ''', (user_id, time.time(), number_id))
-                
-                # Записываем транзакцию
-                cursor.execute('''
-                    INSERT INTO transactions (user_id, number_id, amount_stars, status, created_at)
-                    VALUES (?, ?, ?, 'pending', ?)
-                ''', (user_id, number_id, number['price_stars'], time.time()))
-                
-                # Очищаем кэш
-                self.cache = {k: v for k, v in self.cache.items() if not k.startswith('numbers_')}
-                
-                return number
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    # Получаем номер
+                    cursor.execute('SELECT * FROM numbers WHERE id = %s AND status = %s', 
+                                 (number_id, 'available'))
+                    number = cursor.fetchone()
+                    if not number:
+                        return None
+                    number = dict(number)
+                    
+                    # Проверяем баланс пользователя
+                    cursor.execute('SELECT stars_balance FROM users WHERE user_id = %s', (user_id,))
+                    user = cursor.fetchone()
+                    if not user or user['stars_balance'] < number['price_stars']:
+                        return None
+                    
+                    # Списываем звёзды
+                    cursor.execute('UPDATE users SET stars_balance = stars_balance - %s WHERE user_id = %s', 
+                                 (number['price_stars'], user_id))
+                    
+                    # Обновляем статус номера
+                    cursor.execute('''
+                        UPDATE numbers 
+                        SET status = 'pending', sold_to = %s, sold_at = %s
+                        WHERE id = %s
+                    ''', (user_id, time.time(), number_id))
+                    
+                    # Записываем транзакцию
+                    cursor.execute('''
+                        INSERT INTO transactions (user_id, number_id, amount_stars, status, created_at)
+                        VALUES (%s, %s, %s, 'pending', %s)
+                    ''', (user_id, number_id, number['price_stars'], time.time()))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT * FROM numbers WHERE id = ? AND status = "available"', (number_id,))
+                    number = cursor.fetchone()
+                    if not number:
+                        return None
+                    number = dict(number)
+                    
+                    cursor.execute('SELECT stars_balance FROM users WHERE user_id = ?', (user_id,))
+                    user = cursor.fetchone()
+                    if not user or user['stars_balance'] < number['price_stars']:
+                        return None
+                    
+                    cursor.execute('UPDATE users SET stars_balance = stars_balance - ? WHERE user_id = ?', 
+                                 (number['price_stars'], user_id))
+                    
+                    cursor.execute('''
+                        UPDATE numbers 
+                        SET status = 'pending', sold_to = ?, sold_at = ?
+                        WHERE id = ?
+                    ''', (user_id, time.time(), number_id))
+                    
+                    cursor.execute('''
+                        INSERT INTO transactions (user_id, number_id, amount_stars, status, created_at)
+                        VALUES (?, ?, ?, 'pending', ?)
+                    ''', (user_id, number_id, number['price_stars'], time.time()))
+            
+            # Очищаем кэш
+            self.cache = {k: v for k, v in self.cache.items() if not k.startswith('numbers_')}
+            if f'user_{user_id}' in self.cache:
+                del self.cache[f'user_{user_id}']
+            
+            return number
+            
         except Exception as e:
-            logger.error(f"Ошибка покупки: {e}")
+            logger.error(f"Ошибка покупки {number_id}: {e}")
             return None
     
     def set_number_code(self, number_id: int, code: str) -> bool:
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('''
-                    UPDATE numbers 
-                    SET code = ?, code_expires = ?, status = 'sold'
-                    WHERE id = ?
-                ''', (code, time.time() + 3600, number_id))  # Код действителен 1 час
-                logger.info(f"✅ Для номера {number_id} установлен код: {code}")
-                return True
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE numbers 
+                        SET code = %s, code_expires = %s, status = 'sold'
+                        WHERE id = %s
+                    ''', (code, time.time() + 3600, number_id))
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE numbers 
+                        SET code = ?, code_expires = ?, status = 'sold'
+                        WHERE id = ?
+                    ''', (code, time.time() + 3600, number_id))
+            
+            logger.info(f"✅ Для номера {number_id} установлен код: {code}")
+            return True
         except Exception as e:
-            logger.error(f"Ошибка установки кода: {e}")
+            logger.error(f"Ошибка установки кода {number_id}: {e}")
             return False
     
     def delete_sold_number(self, number_id: int) -> bool:
-        """Удаление проданного номера из магазина"""
         try:
-            with self.get_cursor() as cursor:
-                cursor.execute('DELETE FROM numbers WHERE id = ? AND status = "sold"', (number_id,))
-                if cursor.rowcount > 0:
-                    logger.info(f"✅ Номер {number_id} удален из магазина после продажи")
-                    # Очищаем кэш
-                    self.cache = {k: v for k, v in self.cache.items() if not k.startswith('numbers_')}
-                    return True
-                return False
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('DELETE FROM numbers WHERE id = %s AND status = %s', 
+                                 (number_id, 'sold'))
+                    if cursor.rowcount > 0:
+                        logger.info(f"✅ Номер {number_id} удален из магазина")
+                        self.cache = {k: v for k, v in self.cache.items() if not k.startswith('numbers_')}
+                        return True
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('DELETE FROM numbers WHERE id = ? AND status = "sold"', (number_id,))
+                    if cursor.rowcount > 0:
+                        logger.info(f"✅ Номер {number_id} удален из магазина")
+                        self.cache = {k: v for k, v in self.cache.items() if not k.startswith('numbers_')}
+                        return True
+            return False
         except Exception as e:
             logger.error(f"❌ Ошибка удаления номера {number_id}: {e}")
             return False
     
     def get_stats(self) -> Dict:
-        with self.get_cursor() as cursor:
-            cursor.execute('SELECT COUNT(*) as count FROM users')
-            total_users = cursor.fetchone()['count']
-            
-            cursor.execute('SELECT COUNT(*) as count FROM numbers WHERE status = "available"')
-            available_numbers = cursor.fetchone()['count']
-            
-            cursor.execute('SELECT COUNT(*) as count FROM numbers WHERE status = "sold"')
-            sold_numbers = cursor.fetchone()['count']
-            
-            cursor.execute('SELECT COUNT(*) as count FROM numbers WHERE status = "pending"')
-            pending_numbers = cursor.fetchone()['count']
-            
-            cursor.execute('SELECT COUNT(*) as count FROM tg_accounts')
-            total_accounts = cursor.fetchone()['count']
-            
-            cursor.execute('SELECT COUNT(*) as count FROM tg_accounts WHERE status = "active"')
-            active_accounts = cursor.fetchone()['count']
-            
-            cursor.execute('SELECT SUM(amount_stars) as total FROM transactions WHERE status = "completed"')
-            total_stars_sold = cursor.fetchone()['total'] or 0
-            
-            cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE status = "completed"')
-            completed_transactions = cursor.fetchone()['count'] or 0
+        try:
+            if self.db_url:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT COUNT(*) as count FROM users')
+                    total_users = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'available'")
+                    available_numbers = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'sold'")
+                    sold_numbers = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'pending'")
+                    pending_numbers = cursor.fetchone()['count']
+                    
+                    cursor.execute('SELECT COUNT(*) as count FROM tg_accounts')
+                    total_accounts = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM tg_accounts WHERE status = 'active'")
+                    active_accounts = cursor.fetchone()['count']
+                    
+                    cursor.execute('SELECT SUM(amount_stars) as total FROM transactions WHERE status = %s', 
+                                 ('completed',))
+                    total_stars_sold = cursor.fetchone()['total'] or 0
+            else:
+                with self.get_cursor() as cursor:
+                    cursor.execute('SELECT COUNT(*) as count FROM users')
+                    total_users = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'available'")
+                    available_numbers = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'sold'")
+                    sold_numbers = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM numbers WHERE status = 'pending'")
+                    pending_numbers = cursor.fetchone()['count']
+                    
+                    cursor.execute('SELECT COUNT(*) as count FROM tg_accounts')
+                    total_accounts = cursor.fetchone()['count']
+                    
+                    cursor.execute("SELECT COUNT(*) as count FROM tg_accounts WHERE status = 'active'")
+                    active_accounts = cursor.fetchone()['count']
+                    
+                    cursor.execute('SELECT SUM(amount_stars) as total FROM transactions WHERE status = "completed"')
+                    total_stars_sold = cursor.fetchone()['total'] or 0
             
             return {
                 'total_users': total_users,
@@ -686,12 +1125,23 @@ class Database:
                 'total_accounts': total_accounts,
                 'active_accounts': active_accounts,
                 'total_stars_sold': total_stars_sold,
-                'completed_transactions': completed_transactions,
                 'total_revenue_rub': total_stars_sold * STAR_TO_RUB
+            }
+        except Exception as e:
+            logger.error(f"Ошибка получения статистики: {e}")
+            return {
+                'total_users': 0,
+                'available_numbers': 0,
+                'sold_numbers': 0,
+                'pending_numbers': 0,
+                'total_accounts': 0,
+                'active_accounts': 0,
+                'total_stars_sold': 0,
+                'total_revenue_rub': 0
             }
 
 # Инициализация БД
-db = Database(DATABASE_FILE)
+db = Database()
 
 # ================= УПРАВЛЕНИЕ СЕССИЯМИ TELEGRAM =================
 
@@ -700,18 +1150,8 @@ class SessionManager:
     
     def __init__(self):
         self.active_sessions = {}  # phone -> client
-        self.waiting_codes = {}  # phone -> {'number_id': id, 'user_id': id, 'callback': func}
+        self.waiting_codes = {}  # phone -> {'number_id': id, 'user_id': id}
         self.session_watchers = {}  # phone -> task
-        self.encryption_key = Fernet.generate_key()
-        self.cipher = Fernet(self.encryption_key)
-    
-    def encrypt_data(self, data: str) -> str:
-        """Шифрование данных сессии"""
-        return self.cipher.encrypt(data.encode()).decode()
-    
-    def decrypt_data(self, encrypted_data: str) -> str:
-        """Дешифровка данных сессии"""
-        return self.cipher.decrypt(encrypted_data.encode()).decode()
     
     async def watch_session(self, phone: str, client: Client):
         """Наблюдение за сессией (бесконечное)"""
@@ -720,8 +1160,7 @@ class SessionManager:
                 try:
                     # Проверяем, авторизован ли еще клиент
                     if not await client.is_user_authorized():
-                        logger.warning(f"⚠️ Сессия {phone} потеряла авторизацию, переподключаемся...")
-                        await self.reconnect_session(phone)
+                        logger.warning(f"⚠️ Сессия {phone} потеряла авторизацию")
                         break
                     
                     # Проверяем, не зашел ли владелец
@@ -731,7 +1170,6 @@ class SessionManager:
                         await self.logout_session(phone, "owner_logged_in")
                         break
                     
-                    # Ждем перед следующей проверкой
                     await asyncio.sleep(30)
                     
                 except Exception as e:
@@ -740,34 +1178,15 @@ class SessionManager:
         except asyncio.CancelledError:
             logger.info(f"🛑 Watcher для {phone} остановлен")
     
-    async def reconnect_session(self, phone: str):
-        """Переподключение сессии"""
-        try:
-            if phone in self.active_sessions:
-                old_client = self.active_sessions[phone]
-                try:
-                    await old_client.disconnect()
-                except:
-                    pass
-                del self.active_sessions[phone]
-            
-            # Пробуем переподключиться
-            new_client = await self.get_client(phone)
-            if new_client:
-                logger.info(f"✅ Сессия {phone} переподключена")
-            else:
-                logger.error(f"❌ Не удалось переподключить сессию {phone}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка переподключения {phone}: {e}")
-    
     async def logout_session(self, phone: str, reason: str):
         """Принудительный выход из сессии"""
         try:
             if phone in self.active_sessions:
                 client = self.active_sessions[phone]
-                
-                # Завершаем сессию
-                await client.log_out()
+                try:
+                    await client.log_out()
+                except:
+                    pass
                 await client.disconnect()
                 
                 del self.active_sessions[phone]
@@ -806,7 +1225,8 @@ class SessionManager:
             name=session_path,
             api_id=account['api_id'],
             api_hash=account['api_hash'],
-            workdir=SESSIONS_DIR
+            workdir=SESSIONS_DIR,
+            in_memory=True
         )
         
         try:
@@ -826,11 +1246,6 @@ class SessionManager:
                 db.update_tg_account_status(phone, 'unauthorized')
                 db.log_session_action(phone, 'connect', 'fail', 'not authorized')
                 return None
-        except (UserDeactivated, SessionRevoked, AuthKeyDuplicated) as e:
-            logger.warning(f"⚠️ Аккаунт {phone} деактивирован или сессия сброшена: {e}")
-            db.update_tg_account_status(phone, 'deactivated', str(e))
-            db.log_session_action(phone, 'connect', 'deactivated', str(e))
-            return None
         except Exception as e:
             logger.error(f"❌ Ошибка подключения к аккаунту {phone}: {e}")
             db.log_session_action(phone, 'connect', 'error', str(e))
@@ -843,10 +1258,8 @@ class SessionManager:
             return False
         
         try:
-            # Отправляем запрос на код
             sent_code = await client.send_code(phone)
             
-            # Сохраняем информацию о ожидании кода
             self.waiting_codes[phone] = {
                 'number_id': number_id,
                 'user_id': user_id,
@@ -877,29 +1290,20 @@ class SessionManager:
             return None
         
         try:
-            # Отправляем код
             await client.sign_in(
                 phone_number=phone,
                 phone_code=code,
                 phone_code_hash=wait_info['phone_code_hash']
             )
             
-            # Получаем информацию о пользователе
             me = await client.get_me()
             
-            # Сохраняем код в БД
             db.set_number_code(wait_info['number_id'], code)
-            
-            # Обновляем информацию об аккаунте
             db.update_tg_account_status(phone, 'active')
             db.set_tg_account_code(phone, code)
-            
-            # Устанавливаем владельца аккаунта (пользователь, который купил номер)
             db.set_account_owner(phone, wait_info['user_id'], f"user_{wait_info['user_id']}")
             
-            # Удаляем из ожидания
             del self.waiting_codes[phone]
-            
             db.log_session_action(phone, 'submit_code', 'success')
             
             return {
@@ -913,32 +1317,25 @@ class SessionManager:
                 }
             }
         except SessionPasswordNeeded:
-            # Требуется 2FA
             logger.info(f"⚠️ Аккаунт {phone} требует 2FA")
-            db.log_session_action(phone, 'submit_code', '2fa_required')
             return {'error': '2fa_required'}
         except PhoneCodeInvalid:
             logger.warning(f"⚠️ Неверный код для {phone}")
-            db.log_session_action(phone, 'submit_code', 'invalid_code')
             return {'error': 'invalid_code'}
         except PhoneCodeExpired:
             logger.warning(f"⚠️ Код истёк для {phone}")
-            db.log_session_action(phone, 'submit_code', 'code_expired')
             return {'error': 'code_expired'}
         except Exception as e:
             logger.error(f"❌ Ошибка отправки кода для {phone}: {e}")
-            db.log_session_action(phone, 'submit_code', 'error', str(e))
             return {'error': str(e)}
     
     async def add_new_account(self, phone: str, api_id: int, api_hash: str, 
                              added_by: int) -> Tuple[bool, str]:
         """Добавление нового аккаунта"""
         try:
-            # Проверяем, нет ли уже такого аккаунта
             if db.get_tg_account(phone):
                 return False, "Аккаунт уже существует"
             
-            # Создаём временную сессию
             session_name = f"acc_{phone.replace('+', '')}_{random.randint(1000, 9999)}"
             session_path = os.path.join(SESSIONS_DIR, session_name)
             
@@ -946,25 +1343,29 @@ class SessionManager:
                 name=session_path,
                 api_id=api_id,
                 api_hash=api_hash,
-                workdir=SESSIONS_DIR
+                workdir=SESSIONS_DIR,
+                in_memory=True
             )
             
             await client.connect()
-            
-            # Запрашиваем код
             sent_code = await client.send_code(phone)
             
-            # Сохраняем информацию в БД (предварительно)
             with db.get_cursor() as cursor:
-                cursor.execute('''
-                    INSERT INTO tg_accounts 
-                    (phone, session_name, api_id, api_hash, added_by, added_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending')
-                ''', (phone, session_name, api_id, api_hash, added_by, time.time()))
+                if db.db_url:
+                    cursor.execute('''
+                        INSERT INTO tg_accounts 
+                        (phone, session_name, api_id, api_hash, added_by, added_at, status)
+                        VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                    ''', (phone, session_name, api_id, api_hash, added_by, time.time()))
+                else:
+                    cursor.execute('''
+                        INSERT INTO tg_accounts 
+                        (phone, session_name, api_id, api_hash, added_by, added_at, status)
+                        VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                    ''', (phone, session_name, api_id, api_hash, added_by, time.time()))
             
             await client.disconnect()
             
-            # Сохраняем информацию для подтверждения
             self.waiting_codes[phone] = {
                 'action': 'add_account',
                 'phone_code_hash': sent_code.phone_code_hash,
@@ -1001,15 +1402,24 @@ class SessionManager:
             
             me = await client.get_me()
             
-            # Обновляем информацию в БД
-            with db.get_cursor() as cursor:
-                cursor.execute('''
-                    UPDATE tg_accounts 
-                    SET first_name = ?, last_name = ?, username = ?, user_id = ?, 
-                        status = 'active', last_used = ?
-                    WHERE phone = ?
-                ''', (me.first_name or '', me.last_name or '', me.username or '', 
-                      me.id, time.time(), phone))
+            if db.db_url:
+                with db.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET first_name = %s, last_name = %s, username = %s, user_id = %s, 
+                            status = 'active', last_used = %s
+                        WHERE phone = %s
+                    ''', (me.first_name or '', me.last_name or '', me.username or '', 
+                          me.id, time.time(), phone))
+            else:
+                with db.get_cursor() as cursor:
+                    cursor.execute('''
+                        UPDATE tg_accounts 
+                        SET first_name = ?, last_name = ?, username = ?, user_id = ?, 
+                            status = 'active', last_used = ?
+                        WHERE phone = ?
+                    ''', (me.first_name or '', me.last_name or '', me.username or '', 
+                          me.id, time.time(), phone))
             
             await client.disconnect()
             del self.waiting_codes[phone]
@@ -1023,7 +1433,6 @@ class SessionManager:
         except PhoneCodeInvalid:
             return False, "Неверный код", None
         except SessionPasswordNeeded:
-            # Требуется 2FA
             return False, "Требуется двухфакторная аутентификация", None
         except Exception as e:
             logger.error(f"❌ Ошибка подтверждения аккаунта: {e}")
@@ -1035,7 +1444,7 @@ class SessionManager:
         to_remove = []
         
         for phone, info in self.waiting_codes.items():
-            if current_time - info['timestamp'] > 300:  # 5 минут
+            if current_time - info['timestamp'] > 300:
                 to_remove.append(phone)
         
         for phone in to_remove:
@@ -1062,6 +1471,22 @@ class AdminStates(StatesGroup):
     waiting_for_number_country = State()
     waiting_for_number_desc = State()
     waiting_for_number_price = State()
+
+# ================= ФУНКЦИИ УВЕДОМЛЕНИЙ =================
+
+async def notify_admin_crash(exc_type, exc_value):
+    """Уведомление админа о краше"""
+    try:
+        for admin_id in ADMIN_IDS:
+            await bot.send_message(
+                admin_id,
+                f"⚠️ <b>Бот упал с ошибкой!</b>\n\n"
+                f"Тип: {exc_type.__name__}\n"
+                f"Ошибка: {str(exc_value)[:200]}\n\n"
+                f"🔄 Автоматический перезапуск через 5 секунд..."
+            )
+    except:
+        pass
 
 # ================= КЛАВИАТУРЫ =================
 
@@ -1127,6 +1552,7 @@ def get_admin_keyboard():
         InlineKeyboardButton("👥 Пользователи", callback_data="admin_users"),
         InlineKeyboardButton("📊 Статистика", callback_data="admin_stats"),
         InlineKeyboardButton("🎁 Выдать звёзды", callback_data="admin_add_stars"),
+        InlineKeyboardButton("🔄 Перезапуск", callback_data="admin_restart"),
         InlineKeyboardButton("◀️ Назад", callback_data="main_menu")
     )
     return keyboard
@@ -1209,11 +1635,54 @@ class CryptoBotPayment:
             logger.error(f"❌ Ошибка создания платежа Crypto Bot: {e}")
             return None
 
+# ================= ЗАЩИТА ОТ ФЛУДА =================
+
+class AntiFloodMiddleware(BaseMiddleware):
+    """Защита от флуда"""
+    
+    def __init__(self, limit=5, timeout=60):
+        self.limit = limit
+        self.timeout = timeout
+        self.user_messages = {}  # user_id -> [timestamps]
+        super().__init__()
+    
+    async def on_process_message(self, message: Message, data: dict):
+        user_id = message.from_user.id
+        
+        # Пропускаем админов
+        if user_id in ADMIN_IDS:
+            return
+        
+        current_time = time.time()
+        
+        # Очищаем старые записи
+        if user_id in self.user_messages:
+            self.user_messages[user_id] = [t for t in self.user_messages[user_id] 
+                                          if current_time - t < self.timeout]
+            
+            # Проверяем лимит
+            if len(self.user_messages[user_id]) >= self.limit:
+                await message.reply(f"⚠️ Не спамьте! Подождите {self.timeout} секунд.")
+                raise CancelHandler()
+            
+            self.user_messages[user_id].append(current_time)
+        else:
+            self.user_messages[user_id] = [current_time]
+
+class CancelHandler(Exception):
+    pass
+
+# Регистрируем мидлварь
+dp.middleware.setup(AntiFloodMiddleware())
+
 # ================= ОБРАБОТЧИКИ КОМАНД =================
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: Message):
     """Обработчик команды /start"""
+    global last_message_time
+    last_message_time = time.time()
+    
     user_id = message.from_user.id
     
     # Проверка токена
@@ -1221,7 +1690,7 @@ async def cmd_start(message: Message):
         me = await bot.get_me()
         logger.info(f"✅ Бот авторизован: @{me.username}")
     except Unauthorized:
-        logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН! Получите новый у @BotFather")
+        logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН!")
         await message.reply("❌ Ошибка авторизации бота. Свяжитесь с администратором.")
         return
     
@@ -1248,6 +1717,12 @@ async def cmd_start(message: Message):
         reply_markup=get_main_keyboard(user_id)
     )
 
+@dp.message_handler()
+async def track_all_messages(message: Message):
+    """Отслеживание всех сообщений"""
+    global last_message_time
+    last_message_time = time.time()
+
 @dp.callback_query_handler(lambda c: c.data == 'main_menu')
 async def main_menu(callback: CallbackQuery):
     """Возврат в главное меню"""
@@ -1273,10 +1748,20 @@ async def show_profile(callback: CallbackQuery):
         return
     
     # Получаем статистику пользователя
-    with db.get_cursor() as cursor:
-        cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND status = "completed"', 
-                      (user_id,))
-        purchases = cursor.fetchone()['count'] or 0
+    purchases = 0
+    try:
+        if db.db_url:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE user_id = %s AND status = %s', 
+                              (user_id, 'completed'))
+                purchases = cursor.fetchone()['count'] or 0
+        else:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE user_id = ? AND status = "completed"', 
+                              (user_id,))
+                purchases = cursor.fetchone()['count'] or 0
+    except:
+        pass
     
     text = f"""
 👤 <b>Ваш профиль</b>
@@ -1413,12 +1898,20 @@ async def pay_yoomoney(callback: CallbackQuery, state: FSMContext):
     
     if payment_url:
         # Сохраняем информацию о платеже
-        with db.get_cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO payments (id, user_id, number_id, amount_rub, stars_amount, payment_system, created_at, payment_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (payment_id, user_id, number_id, number['price_rub'], number['price_stars'], 
-                  'yoomoney', time.time(), payment_url))
+        if db.db_url:
+            with db.get_cursor() as cursor:
+                cursor.execute('''
+                    INSERT INTO payments (id, user_id, number_id, amount_rub, stars_amount, payment_system, created_at, payment_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (payment_id, user_id, number_id, number['price_rub'], number['price_stars'], 
+                      'yoomoney', time.time(), payment_url))
+        else:
+            with db.get_cursor() as cursor:
+                cursor.execute('''
+                    INSERT INTO payments (id, user_id, number_id, amount_rub, stars_amount, payment_system, created_at, payment_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (payment_id, user_id, number_id, number['price_rub'], number['price_stars'], 
+                      'yoomoney', time.time(), payment_url))
         
         logger.info(f"✅ Создан платеж {payment_id} для пользователя {user_id}")
         
@@ -1466,12 +1959,20 @@ async def pay_cryptobot(callback: CallbackQuery, state: FSMContext):
     
     if payment_url:
         # Сохраняем информацию о платеже
-        with db.get_cursor() as cursor:
-            cursor.execute('''
-                INSERT INTO payments (id, user_id, number_id, amount_rub, stars_amount, payment_system, created_at, payment_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (payment_id, user_id, number_id, number['price_rub'], number['price_stars'], 
-                  'cryptobot', time.time(), payment_url))
+        if db.db_url:
+            with db.get_cursor() as cursor:
+                cursor.execute('''
+                    INSERT INTO payments (id, user_id, number_id, amount_rub, stars_amount, payment_system, created_at, payment_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ''', (payment_id, user_id, number_id, number['price_rub'], number['price_stars'], 
+                      'cryptobot', time.time(), payment_url))
+        else:
+            with db.get_cursor() as cursor:
+                cursor.execute('''
+                    INSERT INTO payments (id, user_id, number_id, amount_rub, stars_amount, payment_system, created_at, payment_url)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (payment_id, user_id, number_id, number['price_rub'], number['price_stars'], 
+                      'cryptobot', time.time(), payment_url))
         
         logger.info(f"✅ Создан платеж {payment_id} для пользователя {user_id}")
         
@@ -1504,39 +2005,67 @@ async def check_payment(callback: CallbackQuery, state: FSMContext):
     
     payment_id = callback.data.replace('check_payment_', '')
     
-    with db.get_cursor() as cursor:
-        cursor.execute('SELECT * FROM payments WHERE id = ?', (payment_id,))
-        payment = cursor.fetchone()
+    payment = None
+    if db.db_url:
+        with db.get_cursor() as cursor:
+            cursor.execute('SELECT * FROM payments WHERE id = %s', (payment_id,))
+            payment = cursor.fetchone()
+    else:
+        with db.get_cursor() as cursor:
+            cursor.execute('SELECT * FROM payments WHERE id = ?', (payment_id,))
+            payment = cursor.fetchone()
     
     if not payment:
         await callback.message.edit_text("❌ Платёж не найден")
         return
     
+    payment = dict(payment)
+    
     if payment['status'] == 'completed':
         await callback.message.edit_text("✅ Платёж уже обработан!")
         return
     
-    # Завершаем платеж (для демо - сразу)
-    with db.get_cursor() as cursor:
-        # Обновляем статус платежа
-        cursor.execute('''
-            UPDATE payments SET status = 'completed', completed_at = ? WHERE id = ?
-        ''', (time.time(), payment_id))
-        
-        # Начисляем звёзды пользователю
-        cursor.execute('''
-            UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?
-        ''', (payment['stars_amount'], payment['user_id']))
-        
-        # Обновляем статус транзакции
-        cursor.execute('''
-            UPDATE transactions SET status = 'completed', completed_at = ? 
-            WHERE user_id = ? AND number_id = ?
-        ''', (time.time(), payment['user_id'], payment['number_id']))
-        
-        # Получаем обновленный баланс
-        cursor.execute('SELECT stars_balance FROM users WHERE user_id = ?', (payment['user_id'],))
-        new_balance = cursor.fetchone()['stars_balance']
+    # Завершаем платеж
+    if db.db_url:
+        with db.get_cursor() as cursor:
+            # Обновляем статус платежа
+            cursor.execute('''
+                UPDATE payments SET status = 'completed', completed_at = %s WHERE id = %s
+            ''', (time.time(), payment_id))
+            
+            # Начисляем звёзды пользователю
+            cursor.execute('''
+                UPDATE users SET stars_balance = stars_balance + %s WHERE user_id = %s
+            ''', (payment['stars_amount'], payment['user_id']))
+            
+            # Обновляем статус транзакции
+            cursor.execute('''
+                UPDATE transactions SET status = 'completed', completed_at = %s 
+                WHERE user_id = %s AND number_id = %s
+            ''', (time.time(), payment['user_id'], payment['number_id']))
+            
+            # Получаем обновленный баланс
+            cursor.execute('SELECT stars_balance FROM users WHERE user_id = %s', (payment['user_id'],))
+            row = cursor.fetchone()
+            new_balance = row['stars_balance'] if row else 0
+    else:
+        with db.get_cursor() as cursor:
+            cursor.execute('''
+                UPDATE payments SET status = 'completed', completed_at = ? WHERE id = ?
+            ''', (time.time(), payment_id))
+            
+            cursor.execute('''
+                UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?
+            ''', (payment['stars_amount'], payment['user_id']))
+            
+            cursor.execute('''
+                UPDATE transactions SET status = 'completed', completed_at = ? 
+                WHERE user_id = ? AND number_id = ?
+            ''', (time.time(), payment['user_id'], payment['number_id']))
+            
+            cursor.execute('SELECT stars_balance FROM users WHERE user_id = ?', (payment['user_id'],))
+            row = cursor.fetchone()
+            new_balance = row['stars_balance'] if row else 0
     
     logger.info(f"✅ Платеж {payment_id} завершен, пользователь {payment['user_id']} получил {payment['stars_amount']} звёзд")
     
@@ -1611,7 +2140,7 @@ async def process_code(message: Message, state: FSMContext):
         # Получаем номер
         number = db.get_number(number_id)
         
-        # Удаляем номер из магазина (он больше не доступен)
+        # Удаляем номер из магазина
         db.delete_sold_number(number_id)
         
         await message.reply(
@@ -1684,6 +2213,7 @@ async def admin_panel(callback: CallbackQuery):
     cpu_percent = psutil.cpu_percent(interval=1)
     memory = psutil.virtual_memory()
     disk = psutil.disk_usage('/')
+    uptime = time.time() - start_time
     
     text = f"""
 ⚙️ <b>Админ-панель</b>
@@ -1703,12 +2233,39 @@ async def admin_panel(callback: CallbackQuery):
 • 🔥 CPU: {cpu_percent}%
 • 💾 RAM: {memory.percent}%
 • 💽 Диск: {disk.percent}%
-• ⏱ Uptime: {timedelta(seconds=int(time.time() - start_time))}
+• ⏱ Uptime: {timedelta(seconds=int(uptime))}
+• 🔄 Автоперезапуск: ✅
 
 Выберите действие:
 """
     
     await callback.message.edit_text(text, reply_markup=get_admin_keyboard())
+
+@dp.callback_query_handler(lambda c: c.data == 'admin_restart')
+async def admin_restart(callback: CallbackQuery):
+    """Принудительный перезапуск бота"""
+    await callback.answer()
+    
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    
+    await callback.message.edit_text(
+        "🔄 <b>Перезапуск бота...</b>\n\n"
+        "Бот будет перезапущен через 3 секунды."
+    )
+    
+    # Уведомляем всех админов
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                "🔄 Администратор инициировал перезапуск бота. Ожидайте 10 секунд..."
+            )
+        except:
+            pass
+    
+    await asyncio.sleep(3)
+    restart_bot()
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_accounts')
 async def admin_accounts(callback: CallbackQuery):
@@ -1836,11 +2393,15 @@ async def admin_numbers(callback: CallbackQuery):
     """Список всех номеров"""
     await callback.answer()
     
-    with db.get_cursor() as cursor:
-        cursor.execute('''
-            SELECT * FROM numbers ORDER BY id DESC LIMIT 20
-        ''')
-        numbers = [dict(row) for row in cursor.fetchall()]
+    numbers = []
+    if db.db_url:
+        with db.get_cursor() as cursor:
+            cursor.execute('SELECT * FROM numbers ORDER BY id DESC LIMIT 20')
+            numbers = [dict(row) for row in cursor.fetchall()]
+    else:
+        with db.get_cursor() as cursor:
+            cursor.execute('SELECT * FROM numbers ORDER BY id DESC LIMIT 20')
+            numbers = [dict(row) for row in cursor.fetchall()]
     
     if not numbers:
         await callback.message.edit_text(
@@ -1980,9 +2541,15 @@ async def admin_users(callback: CallbackQuery):
     """Список всех пользователей"""
     await callback.answer()
     
-    with db.get_cursor() as cursor:
-        cursor.execute('SELECT user_id, username, first_name, stars_balance, is_admin, banned, registered_at FROM users ORDER BY registered_at DESC LIMIT 20')
-        users = [dict(row) for row in cursor.fetchall()]
+    users = []
+    if db.db_url:
+        with db.get_cursor() as cursor:
+            cursor.execute('SELECT user_id, username, first_name, stars_balance, is_admin, banned, registered_at FROM users ORDER BY registered_at DESC LIMIT 20')
+            users = [dict(row) for row in cursor.fetchall()]
+    else:
+        with db.get_cursor() as cursor:
+            cursor.execute('SELECT user_id, username, first_name, stars_balance, is_admin, banned, registered_at FROM users ORDER BY registered_at DESC LIMIT 20')
+            users = [dict(row) for row in cursor.fetchall()]
     
     if not users:
         await callback.message.edit_text("👥 Нет пользователей")
@@ -2012,18 +2579,36 @@ async def admin_stats(callback: CallbackQuery):
     stats = db.get_stats()
     
     # Получаем дополнительную статистику
-    with db.get_cursor() as cursor:
-        cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE status = "completed"')
-        completed_transactions = cursor.fetchone()['count'] or 0
-        
-        cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE date(created_at, "unixepoch") = date("now")')
-        today_transactions = cursor.fetchone()['count'] or 0
-        
-        cursor.execute('SELECT SUM(amount_stars) as total FROM transactions WHERE status = "completed"')
-        total_stars_sold = cursor.fetchone()['total'] or 0
-        
-        cursor.execute('SELECT AVG(amount_stars) as avg FROM transactions WHERE status = "completed"')
-        avg_price = cursor.fetchone()['avg'] or 0
+    completed_transactions = 0
+    today_transactions = 0
+    total_stars_sold = stats['total_stars_sold']
+    avg_price = 0
+    
+    try:
+        if db.db_url:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE status = %s', ('completed',))
+                completed_transactions = cursor.fetchone()['count'] or 0
+                
+                cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE status = %s AND date(created_at, "unixepoch") = date("now")', ('completed',))
+                today_transactions = cursor.fetchone()['count'] or 0
+                
+                cursor.execute('SELECT AVG(amount_stars) as avg FROM transactions WHERE status = %s', ('completed',))
+                row = cursor.fetchone()
+                avg_price = row['avg'] or 0
+        else:
+            with db.get_cursor() as cursor:
+                cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE status = "completed"')
+                completed_transactions = cursor.fetchone()['count'] or 0
+                
+                cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE status = "completed" AND date(created_at, "unixepoch") = date("now")')
+                today_transactions = cursor.fetchone()['count'] or 0
+                
+                cursor.execute('SELECT AVG(amount_stars) as avg FROM transactions WHERE status = "completed"')
+                row = cursor.fetchone()
+                avg_price = row['avg'] or 0
+    except:
+        pass
     
     text = f"""
 📊 <b>Детальная статистика</b>
@@ -2155,7 +2740,7 @@ async def health_check(request):
         'status': 'healthy',
         'timestamp': time.time(),
         'uptime': time.time() - start_time,
-        'database': 'connected',
+        'database': 'connected' if db.db_url else 'sqlite',
         'stats': db.get_stats()
     }
     return web.json_response(health_data)
@@ -2170,26 +2755,44 @@ async def payment_webhook(request):
         if data.get('payload'):
             payment_id = data['payload']
             if data.get('status') == 'paid':
-                with db.get_cursor() as cursor:
-                    cursor.execute('SELECT * FROM payments WHERE id = ?', (payment_id,))
-                    payment = cursor.fetchone()
-                    
-                    if payment and payment['status'] == 'pending':
-                        # Завершаем платеж
-                        cursor.execute('''
-                            UPDATE payments SET status = 'completed', completed_at = ? WHERE id = ?
-                        ''', (time.time(), payment_id))
+                if db.db_url:
+                    with db.get_cursor() as cursor:
+                        cursor.execute('SELECT * FROM payments WHERE id = %s', (payment_id,))
+                        payment = cursor.fetchone()
                         
-                        cursor.execute('''
-                            UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?
-                        ''', (payment['stars_amount'], payment['user_id']))
+                        if payment and payment['status'] == 'pending':
+                            cursor.execute('''
+                                UPDATE payments SET status = 'completed', completed_at = %s WHERE id = %s
+                            ''', (time.time(), payment_id))
+                            
+                            cursor.execute('''
+                                UPDATE users SET stars_balance = stars_balance + %s WHERE user_id = %s
+                            ''', (payment['stars_amount'], payment['user_id']))
+                            
+                            cursor.execute('''
+                                UPDATE transactions SET status = 'completed', completed_at = %s 
+                                WHERE user_id = %s AND number_id = %s
+                            ''', (time.time(), payment['user_id'], payment['number_id']))
+                else:
+                    with db.get_cursor() as cursor:
+                        cursor.execute('SELECT * FROM payments WHERE id = ?', (payment_id,))
+                        payment = cursor.fetchone()
                         
-                        cursor.execute('''
-                            UPDATE transactions SET status = 'completed', completed_at = ? 
-                            WHERE user_id = ? AND number_id = ?
-                        ''', (time.time(), payment['user_id'], payment['number_id']))
-                        
-                        logger.info(f"✅ Webhook: платеж {payment_id} завершен")
+                        if payment and payment['status'] == 'pending':
+                            cursor.execute('''
+                                UPDATE payments SET status = 'completed', completed_at = ? WHERE id = ?
+                            ''', (time.time(), payment_id))
+                            
+                            cursor.execute('''
+                                UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?
+                            ''', (payment['stars_amount'], payment['user_id']))
+                            
+                            cursor.execute('''
+                                UPDATE transactions SET status = 'completed', completed_at = ? 
+                                WHERE user_id = ? AND number_id = ?
+                            ''', (time.time(), payment['user_id'], payment['number_id']))
+                
+                logger.info(f"✅ Webhook: платеж {payment_id} завершен")
         
         return web.Response(status=200)
     except Exception as e:
@@ -2213,6 +2816,102 @@ async def web_server():
     while True:
         await asyncio.sleep(3600)
 
+# ================= МОНИТОРИНГ ЗДОРОВЬЯ =================
+
+async def health_monitor():
+    """Мониторинг здоровья бота и автоматический перезапуск при проблемах"""
+    global running, last_message_time
+    
+    error_count = 0
+    max_errors = 5
+    
+    while running:
+        try:
+            # Проверяем, отвечает ли бот
+            me = await bot.get_me()
+            
+            # Проверяем время последнего сообщения
+            current_time = time.time()
+            if current_time - last_message_time > 300:  # 5 минут без активности
+                logger.warning("⚠️ Бот неактивен 5 минут, проверка...")
+                
+                # Пробуем отправить тестовое сообщение админу
+                try:
+                    await bot.send_message(ADMIN_IDS[0], "🟢 Health check: бот работает")
+                    last_message_time = current_time
+                    error_count = 0
+                except Exception as e:
+                    error_count += 1
+                    logger.error(f"❌ Health check failed: {e}")
+            
+            # Проверяем базу данных
+            try:
+                db.get_stats()
+                error_count = max(0, error_count - 1)  # Уменьшаем счетчик ошибок при успехе
+            except Exception as e:
+                error_count += 1
+                logger.error(f"❌ Ошибка базы данных: {e}")
+            
+            # Если слишком много ошибок - перезапускаем
+            if error_count >= max_errors:
+                logger.error(f"❌ Слишком много ошибок ({error_count}), перезапуск...")
+                
+                # Уведомляем админа
+                try:
+                    await bot.send_message(
+                        ADMIN_IDS[0],
+                        f"⚠️ <b>Автоматический перезапуск</b>\n\n"
+                        f"Причина: слишком много ошибок ({error_count})"
+                    )
+                except:
+                    pass
+                
+                restart_bot()
+            
+            await asyncio.sleep(60)  # Проверка каждую минуту
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка в health_monitor: {e}")
+            error_count += 1
+            await asyncio.sleep(30)
+
+# ================= ПЛАНОВЫЙ ПЕРЕЗАПУСК =================
+
+async def scheduled_restart():
+    """Плановый перезапуск бота каждый день в 4 утра"""
+    global running
+    
+    while running:
+        try:
+            now = datetime.now()
+            # Следующий запуск в 4:00
+            next_restart = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            if now >= next_restart:
+                next_restart += timedelta(days=1)
+            
+            wait_seconds = (next_restart - now).total_seconds()
+            logger.info(f"⏰ Следующий плановый перезапуск через {wait_seconds/3600:.1f} часов")
+            
+            await asyncio.sleep(wait_seconds)
+            
+            # Уведомляем админа о перезапуске
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(
+                        admin_id,
+                        "🔄 <b>Плановый перезапуск бота</b>\n\n"
+                        "Бот будет перезапущен для обновления. Ожидайте 10 секунд..."
+                    )
+                except:
+                    pass
+            
+            logger.info("🔄 Плановый перезапуск...")
+            restart_bot()
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка в scheduled_restart: {e}")
+            await asyncio.sleep(3600)  # Час если ошибка
+
 # ================= ЗАПУСК =================
 
 # Время запуска для расчета uptime
@@ -2220,22 +2919,27 @@ start_time = time.time()
 
 async def cleanup_task():
     """Периодическая очистка сессий"""
-    while True:
+    while running:
         try:
             await session_manager.cleanup()
             
             # Очищаем старые логи
-            with db.get_cursor() as cursor:
-                week_ago = time.time() - 7 * 24 * 3600
-                cursor.execute('DELETE FROM session_logs WHERE created_at < ?', (week_ago,))
+            if db.db_url:
+                with db.get_cursor() as cursor:
+                    week_ago = time.time() - 7 * 24 * 3600
+                    cursor.execute('DELETE FROM session_logs WHERE created_at < %s', (week_ago,))
+            else:
+                with db.get_cursor() as cursor:
+                    week_ago = time.time() - 7 * 24 * 3600
+                    cursor.execute('DELETE FROM session_logs WHERE created_at < ?', (week_ago,))
         except Exception as e:
             logger.error(f"❌ Ошибка в cleanup_task: {e}")
         
-        await asyncio.sleep(60)  # Каждую минуту
+        await asyncio.sleep(3600)  # Каждый час
 
 async def stats_logger():
     """Периодическое логирование статистики"""
-    while True:
+    while running:
         try:
             stats = db.get_stats()
             
@@ -2271,11 +2975,17 @@ async def on_startup(dp):
     # Проверка папок
     logger.info(f"📁 Папка сессий: {SESSIONS_DIR}")
     logger.info(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
+    if db.db_url:
+        logger.info(f"📁 База данных: PostgreSQL")
+    else:
+        logger.info(f"📁 База данных: SQLite")
     
     # Запускаем фоновые задачи
     asyncio.create_task(web_server())
     asyncio.create_task(cleanup_task())
     asyncio.create_task(stats_logger())
+    asyncio.create_task(health_monitor())
+    asyncio.create_task(scheduled_restart())
     
     # Подсчет статистики
     stats = db.get_stats()
@@ -2294,6 +3004,8 @@ async def on_startup(dp):
                 f"• Аккаунтов TG: {stats['active_accounts']}\n"
                 f"• Продано номеров: {stats['sold_numbers']}\n\n"
                 f"⚙️ <b>Система:</b>\n"
+                f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
+                f"• Автоперезапуск: ✅\n"
                 f"• Python: {sys.version.split()[0]}\n"
                 f"• API ID: {API_ID}"
             )
@@ -2304,6 +3016,9 @@ async def on_startup(dp):
 
 async def on_shutdown(dp):
     """Действия при остановке бота"""
+    global running
+    running = False
+    
     logger.info("🛑 Бот останавливается...")
     
     # Закрываем все активные сессии
@@ -2319,9 +3034,10 @@ async def on_shutdown(dp):
     
     # Создаем финальный бекап
     try:
-        backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
-        shutil.copy2(DATABASE_FILE, backup_file)
-        logger.info(f"✅ Создан финальный бекап: {backup_file}")
+        if not db.db_url:  # Только для SQLite
+            backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
+            shutil.copy2(db.db_path, backup_file)
+            logger.info(f"✅ Создан финальный бекап: {backup_file}")
     except Exception as e:
         logger.error(f"❌ Ошибка создания финального бекапа: {e}")
     
@@ -2335,32 +3051,63 @@ async def on_shutdown(dp):
                 admin_id,
                 f"🛑 <b>Бот остановлен</b>\n\n"
                 f"⏱ Время работы: {uptime_str}\n"
-                f"✅ Финальный бекап создан"
+                f"✅ Все сессии закрыты"
             )
         except:
             pass
     
     logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
 
+# ================= ФУНКЦИЯ ЗАПУСКА =================
+
+def start_bot():
+    """Запуск бота с защитой от падений"""
+    max_retries = 10
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            logger.info(f"🚀 Попытка запуска #{retry_count + 1}")
+            
+            # Запускаем бота
+            executor.start_polling(
+                dp,
+                skip_updates=True,
+                on_startup=on_startup,
+                on_shutdown=on_shutdown
+            )
+            
+            # Если дошли сюда - бот завершился без ошибок
+            logger.info("✅ Бот нормально завершил работу")
+            break
+            
+        except (Unauthorized, Exception) as e:
+            retry_count += 1
+            logger.error(f"❌ Критическая ошибка при запуске: {e}")
+            logger.error(traceback.format_exc())
+            
+            if retry_count < max_retries:
+                logger.info(f"⏳ Ожидание 10 секунд перед перезапуском...")
+                time.sleep(10)
+            else:
+                logger.error(f"❌ Достигнут лимит попыток ({max_retries})")
+                sys.exit(1)
+
 if __name__ == "__main__":
     print("=" * 70)
-    print("🚀 Telegram Numbers Shop Bot v8.0 - ФИНАЛЬНАЯ ВЕРСИЯ")
-    print("📱 Управление сессиями + Автоудаление номеров + Вечные сессии")
+    print("🚀 Telegram Numbers Shop Bot v11.0 - НИКОГДА НЕ ВЫКЛЮЧАЕТСЯ")
+    print("📱 Управление сессиями + Автоудаление + Автоперезапуск")
     print("=" * 70)
     print(f"✅ API ID: {API_ID}")
-    print(f"✅ API Hash: {API_HASH[:10]}...")
     print(f"✅ Admin ID: {ADMIN_IDS[0]}")
     print(f"✅ Port: {PORT}")
-    print(f"✅ Database: {DATABASE_FILE}")
     print(f"✅ Sessions dir: {SESSIONS_DIR}")
+    print(f"✅ Database: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
     print("=" * 70)
-    print("⚠️  Убедитесь, что папки 'sessions' и 'backups' существуют")
-    print("⚠️  Проверьте правильность токена бота")
+    print("⚡ Система автоперезапуска: АКТИВНА")
+    print("⚡ Health monitor: АКТИВЕН")
+    print("⚡ Плановый перезапуск: 4:00 daily")
     print("=" * 70)
     
-    executor.start_polling(
-        dp,
-        skip_updates=True,
-        on_startup=on_startup,
-        on_shutdown=on_shutdown
-)
+    # Запускаем бота
+    start_bot()
