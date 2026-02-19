@@ -119,7 +119,7 @@ except Exception as e:
 # ================= КОНФИГУРАЦИЯ =================
 
 # ✅ НОВЫЙ ТОКЕН БОТА
-BOT_TOKEN = "8594091933:AAFOYjDluUdXL-6sEINEu0ovt57wZ9cU-QE"
+BOT_TOKEN = "8594091933:AAFyE7GRVA-QO06mdoUYKLHAqP0N0twDC0s"
 
 # ✅ СПИСОК АДМИНОВ
 ADMIN_IDS = [8443743937, 7828977683]
