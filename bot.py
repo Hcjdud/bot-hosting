@@ -1,6 +1,6 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 18.0 (FINAL - ПОЛНАЯ ВЕРСИЯ)
+Версия: 19.0 (FINAL - ИСПРАВЛЕННАЯ ВЕРСИЯ)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
 from contextlib import contextmanager
-from urllib.parse import urlparse
+from urllib.parse import urlencode
 from functools import wraps
 
 # Дополнительные импорты
@@ -52,8 +52,20 @@ import psycopg2.extras
 # Загружаем переменные окружения
 load_dotenv()
 
-# ================= ПРОВЕРКА RENDER =================
+# ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('bot.log')
+    ]
+)
+logger = logging.getLogger(__name__)
 
+logger.info("🚀 Запуск бота...")
+
+# ================= ПРОВЕРКА RENDER =================
 IS_RENDER = os.environ.get('RENDER', False)
 RENDER_EXTERNAL_URL = os.environ.get('RENDER_EXTERNAL_URL', 'localhost')
 PORT = int(os.environ.get('PORT', 8080))
@@ -66,7 +78,7 @@ if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
 
 # Настройка путей
 if IS_RENDER:
-    print("🔄 Запуск на Render платформе")
+    logger.info("🔄 Запуск на Render платформе")
     SESSIONS_DIR = '/tmp/sessions'
     DATABASE_BACKUP_DIR = '/tmp/backups'
 else:
@@ -117,10 +129,15 @@ from pyrogram.errors import (
 # Для веб-сервера
 from aiohttp import web
 
+# ================= КЛАСС ДЛЯ ОБРАБОТКИ ОТМЕНЫ =================
+class CancelHandler(Exception):
+    """Исключение для отмены обработки"""
+    pass
+
 # ================= КОНФИГУРАЦИЯ =================
 
-# Берем токен из переменных окружения
-BOT_TOKEN = os.environ.get('BOT_TOKEN', "8594091933:AAHk_2iQEdLtlP48zbEqAow3JS4wYxQo0rY")
+# ✅ НОВЫЙ ТОКЕН БОТА
+BOT_TOKEN = "8594091933:AAFOYjDluUdXL-6sEINEu0ovt57wZ9cU-QE"
 
 # ✅ СПИСОК АДМИНОВ
 ADMIN_IDS = [8443743937, 7828977683]
@@ -146,17 +163,6 @@ MAX_TOPUP_AMOUNT = 100000
 # Настройки кэша
 CACHE_TTL = 60
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log')
-    ]
-)
-logger = logging.getLogger(__name__)
-
 logger.info(f"📁 Sessions dir: {SESSIONS_DIR}")
 logger.info(f"📁 Backups dir: {DATABASE_BACKUP_DIR}")
 logger.info(f"👥 Администраторы: {ADMIN_IDS}")
@@ -164,6 +170,7 @@ if DATABASE_URL:
     logger.info(f"✅ Используется PostgreSQL")
 else:
     logger.info(f"⚠️ Используется SQLite")
+logger.info(f"✅ Токен бота: {BOT_TOKEN[:10]}...")
 
 # Инициализация бота
 storage = MemoryStorage()
@@ -3825,7 +3832,7 @@ def start_bot():
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("🚀 Telegram Numbers Shop Bot v18.0 - ФИНАЛЬНАЯ ВЕРСИЯ")
+    print("🚀 Telegram Numbers Shop Bot v19.0 - ФИНАЛЬНАЯ ВЕРСИЯ")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
     print("✅ Сессии СОХРАНЯЮТСЯ в файлы")
     print("=" * 70)
@@ -3833,6 +3840,7 @@ if __name__ == "__main__":
     print(f"📁 Папка сессий: {SESSIONS_DIR}")
     print(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
     print(f"💾 База данных: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
+    print(f"✅ Новый токен: {BOT_TOKEN[:15]}...")
     print("=" * 70)
     print("⚡ Система автоперезапуска: АКТИВНА")
     print("⚡ Health monitor: АКТИВЕН")
