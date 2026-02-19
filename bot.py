@@ -1,29 +1,7 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 24.0 (ULTIMATE - НАСТРАИВАЕМОЕ МЕНЮ)
-Функции:
-- Продажа виртуальных номеров Telegram
-- Создание и управление сессиями Telegram аккаунтов
-- Автоматическое получение кодов подтверждения
-- Поддержка двухфакторной аутентификации (2FA)
-- 3 СПОСОБА ПОПОЛНЕНИЯ БАЛАНСА
-- Админ-панель с выдачей звёзд
-- ✅ НАСТРАИВАЕМОЕ МЕНЮ (текст, описание, фото/гифка)
-- ✅ ИЗМЕНЕНИЕ ПРОФИЛЯ В АДМИНКЕ
-- ✅ ЗАГРУЗКА ФОТО И ГИФОК
-- ✅ ОБЯЗАТЕЛЬНЫЕ ПОДПИСКИ НА КАНАЛЫ (до 5 каналов)
-- ✅ ПРОВЕРКА ПОДПИСКИ ПРИ ПОКУПКЕ
-- ✅ УПРАВЛЕНИЕ КАНАЛАМИ В АДМИНКЕ
-- ✅ АДМИНЫ ИМЕЮТ БЕСКОНЕЧНЫЙ БАЛАНС (♾)
-- ✅ УДАЛЕНИЕ СЕССИЙ И НОМЕРОВ
-- ✅ СЕССИИ СОХРАНЯЮТСЯ В ФАЙЛЫ
-- ✅ СИСТЕМА "ВЕЧНОЙ РАБОТЫ" (НЕ ВЫКЛЮЧАЕТСЯ)
-- ✅ АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК ПРИ СБОЯХ
-- ✅ ПИНГ-СИСТЕМА ДЛЯ RENDER
-- Полный мониторинг и логирование
-- Поддержка PostgreSQL на Render
+Версия: 24.1 (FIXED - Dispatcher)
 """
-
 import os
 import sys
 import asyncio
@@ -37,8 +15,6 @@ import uuid
 import shutil
 import signal
 import traceback
-import subprocess
-import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -60,8 +36,35 @@ from Crypto.Cipher import AES
 import psycopg2
 import psycopg2.extras
 
-# Загружаем переменные окружения
-load_dotenv()
+# Импорты для aiogram (ПЕРЕНЕСЕНЫ ВВЕРХ!)
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.dispatcher.middlewares import BaseMiddleware
+from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, ContentType
+from aiogram.utils import executor
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.utils.callback_data import CallbackData
+from aiogram.utils.exceptions import Unauthorized, RestartingTelegram, TerminatedByOtherGetUpdates
+
+# Pyrogram для управления сессиями
+from pyrogram import Client
+from pyrogram.errors import (
+    SessionPasswordNeeded, 
+    PhoneCodeInvalid, 
+    PhoneNumberInvalid,
+    FloodWait,
+    PhoneCodeExpired,
+    PasswordHashInvalid,
+    UserDeactivated,
+    SessionRevoked,
+    AuthKeyDuplicated
+)
+
+# Для веб-сервера
+from aiohttp import web
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 logging.basicConfig(
@@ -113,41 +116,6 @@ try:
 except Exception as e:
     logger.error(f"❌ Нет доступа к папке сессий {SESSIONS_DIR}: {e}")
 
-# Импорты для aiogram
-from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.types import Message, CallbackQuery, ContentType
-from aiogram.utils import executor
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
-from aiogram.utils.callback_data import CallbackData
-from aiogram.utils.exceptions import Unauthorized, RestartingTelegram, TerminatedByOtherGetUpdates
-
-# Pyrogram для управления сессиями
-from pyrogram import Client
-from pyrogram.errors import (
-    SessionPasswordNeeded, 
-    PhoneCodeInvalid, 
-    PhoneNumberInvalid,
-    FloodWait,
-    PhoneCodeExpired,
-    PasswordHashInvalid,
-    UserDeactivated,
-    SessionRevoked,
-    AuthKeyDuplicated
-)
-
-# Для веб-сервера
-from aiohttp import web
-
-# ================= КЛАСС ДЛЯ ОБРАБОТКИ ОТМЕНЫ =================
-class CancelHandler(Exception):
-    """Исключение для отмены обработки"""
-    pass
-
 # ================= КОНФИГУРАЦИЯ =================
 
 # ✅ НОВЫЙ ТОКЕН БОТА
@@ -183,13 +151,37 @@ INFINITY = "♾"
 # Максимальное количество каналов для подписки
 MAX_CHANNELS = 5
 
+# ================= ИНИЦИАЛИЗАЦИЯ БОТА =================
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+dp = Dispatcher(bot, storage=storage)
+dp.middleware.setup(LoggingMiddleware())
+
+# Callback data для инлайн кнопок
+numbers_cb = CallbackData('numbers', 'page')
+buy_cb = CallbackData('buy', 'number_id')
+sessions_cb = CallbackData('sessions', 'page')
+session_cb = CallbackData('session', 'action', 'phone')
+admin_cb = CallbackData('admin', 'action', 'page')
+payment_cb = CallbackData('payment', 'action', 'payment_id')
+account_cb = CallbackData('account', 'action', 'phone')
+user_cb = CallbackData('user', 'action', 'user_id')
+topup_cb = CallbackData('topup', 'method', 'amount')
+number_cb = CallbackData('number', 'action', 'number_id')
+channel_cb = CallbackData('channel', 'action', 'channel_id')
+
+# ================= КЛАСС ДЛЯ ОБРАБОТКИ ОТМЕНЫ =================
+class CancelHandler(Exception):
+    """Исключение для отмены обработки"""
+    pass
+
 # ================= СИСТЕМА "ВЕЧНОЙ РАБОТЫ" =================
 
 running = True
 restart_requested = False
 last_message_time = time.time()
 restart_count = 0
-max_restarts = 1000  # Увеличено до 1000
+max_restarts = 1000
 restart_window = 3600
 restart_times = []
 uptime_start = time.time()
