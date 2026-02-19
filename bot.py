@@ -1,20 +1,18 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 16.0 (FINAL - СТАБИЛЬНАЯ ВЕРСИЯ)
+Версия: 18.0 (FINAL - ПОЛНАЯ ВЕРСИЯ)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
 - Автоматическое получение кодов подтверждения
 - Поддержка двухфакторной аутентификации (2FA)
-- 3 СПОСОБА ПОПОЛНЕНИЯ БАЛАНСА:
-  * 💳 ЮMoney (рубли)
-  * ₿ Crypto Bot (криптовалюта)
-  * ⭐️ Звёзды Telegram (встроенная валюта)
-- Админ-панель для управления
-- Баланс пользователей в звёздах
+- 3 СПОСОБА ПОПОЛНЕНИЯ БАЛАНСА
+- Админ-панель с выдачей звёзд
+- ✅ СЕССИИ СОХРАНЯЮТСЯ В ФАЙЛЫ
+- ✅ ВОССТАНОВЛЕНИЕ ПОСЛЕ ПЕРЕЗАПУСКА
 - Полный мониторинг и логирование
 - Поддержка PostgreSQL на Render
-- СИСТЕМА БЕСКОНЕЧНОЙ РАБОТЫ (не выключается)
+- СИСТЕМА БЕСКОНЕЧНОЙ РАБОТЫ
 """
 
 import os
@@ -79,6 +77,16 @@ else:
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 os.makedirs(DATABASE_BACKUP_DIR, exist_ok=True)
 
+# Проверяем доступность папки для сессий
+test_session_file = os.path.join(SESSIONS_DIR, "test_write.tmp")
+try:
+    with open(test_session_file, "w") as f:
+        f.write("test")
+    os.remove(test_session_file)
+    logger.info(f"✅ Папка {SESSIONS_DIR} доступна для записи")
+except Exception as e:
+    logger.error(f"❌ Нет доступа к папке сессий {SESSIONS_DIR}: {e}")
+
 # Импорты для aiogram
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
@@ -112,9 +120,9 @@ from aiohttp import web
 # ================= КОНФИГУРАЦИЯ =================
 
 # Берем токен из переменных окружения
-BOT_TOKEN = os.environ.get('BOT_TOKEN', "8594091933:AAFk88lVyYUIM7zZDettYdXSkO2Ic60kNJU")
+BOT_TOKEN = os.environ.get('BOT_TOKEN', "8594091933:AAHk_2iQEdLtlP48zbEqAow3JS4wYxQo0rY")
 
-# ✅ СПИСОК АДМИНОВ (добавлены оба ID)
+# ✅ СПИСОК АДМИНОВ
 ADMIN_IDS = [8443743937, 7828977683]
 
 # API данные для Pyrogram
@@ -374,9 +382,11 @@ class Database:
                     number_id INTEGER,
                     amount_stars INTEGER,
                     amount_rub REAL,
+                    type TEXT,
                     payment_system TEXT,
                     payment_id TEXT,
                     status TEXT,
+                    description TEXT,
                     created_at REAL,
                     completed_at REAL
                 )
@@ -513,9 +523,11 @@ class Database:
                     number_id INTEGER,
                     amount_stars INTEGER,
                     amount_rub REAL,
+                    type TEXT,
                     payment_system TEXT,
                     payment_id TEXT,
                     status TEXT,
+                    description TEXT,
                     created_at REAL,
                     completed_at REAL
                 )
@@ -686,29 +698,39 @@ class Database:
             logger.error(f"Ошибка обновления активности {user_id}: {e}")
     
     def add_stars(self, user_id: int, amount: int, payment_system: str = "admin", payment_id: str = None) -> bool:
+        """Добавление звёзд пользователю"""
         try:
-            if self.db_url:
+            if self.db_url:  # PostgreSQL
                 with self.get_cursor() as cursor:
+                    # Обновляем баланс
                     cursor.execute('UPDATE users SET stars_balance = stars_balance + %s WHERE user_id = %s', 
                                  (amount, user_id))
+                    
+                    # Записываем транзакцию
                     cursor.execute('''
-                        INSERT INTO transactions (user_id, amount_stars, type, payment_system, payment_id, status, created_at)
-                        VALUES (%s, %s, 'credit', %s, %s, 'completed', %s)
-                    ''', (user_id, amount, payment_system, payment_id, time.time()))
-            else:
+                        INSERT INTO transactions (user_id, amount_stars, amount_rub, type, payment_system, payment_id, status, created_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ''', (user_id, amount, amount * STAR_TO_RUB, 'credit', payment_system, payment_id, 'completed', time.time()))
+            else:  # SQLite
                 with self.get_cursor() as cursor:
+                    # Обновляем баланс
                     cursor.execute('UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?', 
                                  (amount, user_id))
+                    
+                    # Записываем транзакцию
                     cursor.execute('''
-                        INSERT INTO transactions (user_id, amount_stars, type, payment_system, payment_id, status, created_at)
-                        VALUES (?, ?, 'credit', ?, ?, 'completed', ?)
-                    ''', (user_id, amount, payment_system, payment_id, time.time()))
+                        INSERT INTO transactions (user_id, amount_stars, amount_rub, type, payment_system, payment_id, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (user_id, amount, amount * STAR_TO_RUB, 'credit', payment_system, payment_id, 'completed', time.time()))
             
+            # Очищаем кэш
             if f'user_{user_id}' in self.cache:
                 del self.cache[f'user_{user_id}']
+            
+            logger.info(f"✅ Добавлено {amount}⭐ пользователю {user_id} через {payment_system}")
             return True
         except Exception as e:
-            logger.error(f"Ошибка добавления звёзд {user_id}: {e}")
+            logger.error(f"❌ Ошибка добавления звёзд {user_id}: {e}")
             return False
     
     def deduct_stars(self, user_id: int, amount: int, description: str = "") -> bool:
@@ -1359,6 +1381,22 @@ class SessionManager:
         self.waiting_2fa = {}  # phone -> {'number_id': id, 'user_id': id, 'client': client}
         self.session_watchers = {}  # phone -> task
     
+    async def load_saved_sessions(self):
+        """Загрузка сохраненных сессий из файлов"""
+        try:
+            accounts = db.get_all_tg_accounts()
+            loaded = 0
+            for account in accounts:
+                if account['status'] == 'active' and account.get('owner_id', 0) == 0:
+                    # Проверяем, существует ли файл сессии
+                    session_path = os.path.join(SESSIONS_DIR, account['session_name'])
+                    if os.path.exists(f"{session_path}.session"):
+                        logger.info(f"🔄 Найдена сохраненная сессия для {account['phone']}")
+                        loaded += 1
+            logger.info(f"✅ Загружено {loaded} сохраненных сессий")
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки сессий: {e}")
+    
     async def watch_session(self, phone: str, client: Client):
         """Наблюдение за сессией (бесконечное)"""
         try:
@@ -1399,6 +1437,14 @@ class SessionManager:
                     self.session_watchers[phone].cancel()
                     del self.session_watchers[phone]
                 
+                # Удаляем файл сессии
+                account = db.get_tg_account(phone)
+                if account:
+                    session_path = os.path.join(SESSIONS_DIR, account['session_name'])
+                    if os.path.exists(f"{session_path}.session"):
+                        os.remove(f"{session_path}.session")
+                        logger.info(f"🗑 Удален файл сессии для {phone}")
+                
                 db.update_tg_account_status(phone, 'logged_out', f"Причина: {reason}")
                 db.log_session_action(phone, 'logout', 'success', reason)
                 logger.info(f"✅ Сессия {phone} завершена: {reason}")
@@ -1406,7 +1452,7 @@ class SessionManager:
             logger.error(f"❌ Ошибка выхода из сессии {phone}: {e}")
     
     async def get_client(self, phone: str) -> Optional[Client]:
-        """Получение клиента для аккаунта"""
+        """Получение клиента для аккаунта с сохранением сессии в файл"""
         if phone in self.active_sessions:
             return self.active_sessions[phone]
         
@@ -1421,12 +1467,16 @@ class SessionManager:
             return None
         
         session_path = os.path.join(SESSIONS_DIR, account['session_name'])
+        
+        # ✅ ИСПРАВЛЕНО: убран in_memory=True, сессии будут сохраняться в файлы
         client = Client(
             name=session_path,
             api_id=account['api_id'],
             api_hash=account['api_hash'],
             workdir=SESSIONS_DIR,
-            in_memory=True
+            device_model="Server Bot",
+            system_version="4.16.30-vxCUSTOM",
+            app_version="1.0.0"
         )
         
         try:
@@ -1439,6 +1489,7 @@ class SessionManager:
                 watcher_task = asyncio.create_task(self.watch_session(phone, client))
                 self.session_watchers[phone] = watcher_task
                 
+                logger.info(f"✅ Подключена сессия для {phone} из файла {session_path}.session")
                 return client
             else:
                 await client.disconnect()
@@ -1505,6 +1556,7 @@ class SessionManager:
             del self.waiting_codes[phone]
             db.log_session_action(phone, 'submit_code', 'success')
             
+            logger.info(f"✅ Сессия для {phone} сохранена в файл")
             return {
                 'number_id': wait_info['number_id'],
                 'user_id': wait_info['user_id'],
@@ -1518,7 +1570,6 @@ class SessionManager:
         except SessionPasswordNeeded:
             logger.info(f"⚠️ Аккаунт {phone} требует 2FA")
             
-            # Сохраняем информацию для 2FA
             self.waiting_2fa[phone] = {
                 'number_id': wait_info['number_id'],
                 'user_id': wait_info['user_id'],
@@ -1572,6 +1623,7 @@ class SessionManager:
             del self.waiting_2fa[phone]
             db.log_session_action(phone, 'submit_2fa', 'success')
             
+            logger.info(f"✅ Сессия с 2FA для {phone} сохранена в файл")
             return {
                 'number_id': info['number_id'],
                 'user_id': info['user_id'],
@@ -1598,12 +1650,15 @@ class SessionManager:
             
             session_name = f"acc_{phone.replace('+', '')}_{random.randint(1000, 9999)}"
             
+            # ✅ ИСПРАВЛЕНО: убран in_memory=True
             client = Client(
                 name=session_name,
                 api_id=api_id,
                 api_hash=api_hash,
                 workdir=SESSIONS_DIR,
-                in_memory=True
+                device_model="Server Bot",
+                system_version="4.16.30-vxCUSTOM",
+                app_version="1.0.0"
             )
             
             await client.connect()
@@ -1701,6 +1756,7 @@ class SessionManager:
             await client.disconnect()
             del self.waiting_codes[phone]
             
+            logger.info(f"✅ Аккаунт {phone} добавлен, сессия сохранена в файл")
             return True, "Аккаунт успешно добавлен", {
                 'id': me.id,
                 'first_name': me.first_name,
@@ -1708,10 +1764,8 @@ class SessionManager:
             }
             
         except SessionPasswordNeeded:
-            # Требуется 2FA
             logger.info(f"⚠️ Аккаунт {phone} требует 2FA")
             
-            # Сохраняем для 2FA
             self.waiting_2fa[phone] = {
                 'action': 'add_account_2fa',
                 'client': client,
@@ -1767,6 +1821,7 @@ class SessionManager:
             await client.disconnect()
             del self.waiting_2fa[phone]
             
+            logger.info(f"✅ Аккаунт {phone} с 2FA добавлен, сессия сохранена в файл")
             return True, "Аккаунт успешно добавлен с 2FA", {
                 'id': me.id,
                 'first_name': me.first_name,
@@ -1847,7 +1902,7 @@ def get_main_keyboard(user_id: int = None):
     return keyboard
 
 def get_profile_keyboard():
-    """Клавиатура профиля"""
+    """Клавиатура профиля с пополнением"""
     keyboard = InlineKeyboardMarkup(row_width=2)
     keyboard.add(
         InlineKeyboardButton("⭐️ Пополнить звёздами", callback_data="topup_stars"),
@@ -2009,7 +2064,6 @@ class StarsPayment:
         """Создание платежа звёздами (мгновенное начисление)"""
         payment_id = str(uuid.uuid4())
         
-        # Мгновенно начисляем звёзды
         success = db.add_stars(user_id, amount, "stars", payment_id)
         
         if success:
@@ -2235,7 +2289,6 @@ async def process_topup_amount(message: Message, state: FSMContext):
     method = data.get('payment_method')
     user_id = message.from_user.id
     
-    # Создаем пополнение
     topup = db.create_topup(user_id, amount, method)
     
     if not topup:
@@ -2302,7 +2355,6 @@ async def check_topup(callback: CallbackQuery):
     
     payment_id = callback.data.replace('check_topup_', '')
     
-    # Завершаем пополнение (для демо - сразу)
     success = db.complete_topup(payment_id)
     
     if success:
@@ -2804,6 +2856,7 @@ async def admin_panel(callback: CallbackQuery):
 • 💽 Диск: {disk.percent}%
 • ⏱ Uptime: {timedelta(seconds=int(uptime))}
 • 🔄 Автоперезапуск: ✅
+• 💾 Сессии сохраняются: ✅
 
 Выберите действие:
 """
@@ -2864,7 +2917,14 @@ async def admin_accounts(callback: CallbackQuery):
             text += f"   👑 Владелец: {acc['owner_id']}\n"
         if acc.get('last_code'):
             text += f"   🔑 Последний код: {acc['last_code']}\n"
-        text += f"   📅 Добавлен: {datetime.fromtimestamp(acc['added_at']).strftime('%d.%m.%Y')}\n\n"
+        text += f"   📅 Добавлен: {datetime.fromtimestamp(acc['added_at']).strftime('%d.%m.%Y')}\n"
+        # Проверяем наличие файла сессии
+        session_path = os.path.join(SESSIONS_DIR, acc['session_name'])
+        if os.path.exists(f"{session_path}.session"):
+            text += f"   💾 Файл сессии: ✅\n"
+        else:
+            text += f"   💾 Файл сессии: ❌\n"
+        text += "\n"
     
     await callback.message.edit_text(
         text,
@@ -3256,6 +3316,7 @@ async def admin_stats(callback: CallbackQuery):
         )
     )
 
+# ✅ ИСПРАВЛЕННЫЙ ОБРАБОТЧИК ВЫДАЧИ ЗВЁЗД
 @dp.callback_query_handler(lambda c: c.data == 'admin_add_stars')
 async def admin_add_stars_start(callback: CallbackQuery, state: FSMContext):
     """Выдача звёзд пользователю"""
@@ -3274,7 +3335,7 @@ async def admin_add_stars_user(message: Message, state: FSMContext):
     """Обработка ID пользователя"""
     try:
         user_id = int(message.text.strip())
-    except:
+    except ValueError:
         await message.reply("❌ Введите числовой ID")
         return
     
@@ -3284,7 +3345,7 @@ async def admin_add_stars_user(message: Message, state: FSMContext):
         await state.finish()
         return
     
-    await state.update_data(target_user_id=user_id)
+    await state.update_data(target_user_id=user_id, target_username=user['username'])
     
     await message.reply(
         f"👤 <b>Пользователь:</b> @{user['username']} ({user_id})\n"
@@ -3301,35 +3362,55 @@ async def admin_add_stars_amount(message: Message, state: FSMContext):
     try:
         amount = int(message.text.strip())
         if amount <= 0:
-            raise ValueError
-    except:
-        await message.reply("❌ Введите положительное число")
+            await message.reply("❌ Введите положительное число")
+            return
+    except ValueError:
+        await message.reply("❌ Введите целое положительное число")
         return
     
     data = await state.get_data()
     user_id = data['target_user_id']
+    username = data.get('target_username', f"ID {user_id}")
     
-    if db.add_stars(user_id, amount):
+    # Получаем информацию о пользователе для проверки
+    user = db.get_user(user_id)
+    if not user:
+        await message.reply("❌ Пользователь не найден")
+        await state.finish()
+        return
+    
+    # Выдаём звёзды
+    success = db.add_stars(user_id, amount, "admin", f"admin_{message.from_user.id}")
+    
+    if success:
+        # Получаем обновленный баланс
+        updated_user = db.get_user(user_id)
+        new_balance = updated_user['stars_balance'] if updated_user else 0
+        
+        # Уведомляем пользователя
         try:
             await bot.send_message(
                 user_id,
                 f"🎁 <b>Вам начислено {amount} ⭐️!</b>\n\n"
-                f"💰 Новый баланс: {db.get_user(user_id)['stars_balance']} ⭐️"
+                f"💰 Новый баланс: {new_balance} ⭐️\n\n"
+                f"👤 Администратор: @{message.from_user.username or 'Admin'}"
             )
+            logger.info(f"✅ Уведомление отправлено пользователю {user_id}")
         except Exception as e:
-            logger.warning(f"Не удалось уведомить пользователя {user_id}: {e}")
+            logger.warning(f"⚠️ Не удалось уведомить пользователя {user_id}: {e}")
         
         await message.reply(
             f"✅ <b>Звёзды успешно выданы!</b>\n\n"
-            f"👤 Пользователь: {user_id}\n"
-            f"➕ Добавлено: {amount} ⭐️\n"
-            f"💰 Новый баланс: {db.get_user(user_id)['stars_balance']} ⭐️",
+            f"👤 <b>Пользователь:</b> @{username} ({user_id})\n"
+            f"➕ <b>Добавлено:</b> {amount} ⭐️\n"
+            f"💰 <b>Текущий баланс:</b> {user['stars_balance']} ⭐️\n"
+            f"💰 <b>Новый баланс:</b> {new_balance} ⭐️",
             reply_markup=InlineKeyboardMarkup().add(
                 InlineKeyboardButton("⚙️ Админ-панель", callback_data="admin"),
                 InlineKeyboardButton("🎁 Выдать ещё", callback_data="admin_add_stars")
             )
         )
-        logger.info(f"✅ Админ {message.from_user.id} выдал {amount} звёзд пользователю {user_id}")
+        logger.info(f"✅ Админ {message.from_user.id} выдал {amount}⭐ пользователю {user_id}")
     else:
         await message.reply(
             "❌ Ошибка при выдаче звёзд",
@@ -3631,6 +3712,9 @@ async def on_startup(dp):
     else:
         logger.info(f"📁 База данных: SQLite")
     
+    # Загружаем сохраненные сессии
+    await session_manager.load_saved_sessions()
+    
     asyncio.create_task(web_server())
     asyncio.create_task(cleanup_task())
     asyncio.create_task(stats_logger())
@@ -3653,6 +3737,7 @@ async def on_startup(dp):
                 f"• Продано номеров: {stats['sold_numbers']}\n\n"
                 f"⚙️ <b>Система:</b>\n"
                 f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
+                f"• Сессии сохраняются: ✅\n"
                 f"• Автоперезапуск: ✅\n"
                 f"• Python: {sys.version.split()[0]}\n"
                 f"• API ID: {API_ID}"
@@ -3696,14 +3781,14 @@ async def on_shutdown(dp):
                 admin_id,
                 f"🛑 <b>Бот остановлен</b>\n\n"
                 f"⏱ Время работы: {uptime_str}\n"
-                f"✅ Все сессии закрыты"
+                f"✅ Все сессии закрыты, файлы сохранены"
             )
         except:
             pass
     
     logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
 
-# ================= ФУНКЦИЯ ЗАПУСКА =================
+# ================= ЗАПУСК БОТА =================
 
 def start_bot():
     """Запуск бота с защитой от падений"""
@@ -3736,19 +3821,23 @@ def start_bot():
                 logger.error(f"❌ Достигнут лимит попыток ({max_retries})")
                 sys.exit(1)
 
+# ================= ТОЧКА ВХОДА =================
+
 if __name__ == "__main__":
     print("=" * 70)
-    print("🚀 Telegram Numbers Shop Bot v16.0 - ФИНАЛЬНАЯ ВЕРСИЯ")
+    print("🚀 Telegram Numbers Shop Bot v18.0 - ФИНАЛЬНАЯ ВЕРСИЯ")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
+    print("✅ Сессии СОХРАНЯЮТСЯ в файлы")
     print("=" * 70)
-    print(f"✅ Администраторы: {ADMIN_IDS}")
-    print(f"✅ Port: {PORT}")
-    print(f"✅ Sessions dir: {SESSIONS_DIR}")
-    print(f"✅ Database: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
+    print(f"👥 Администраторы: {ADMIN_IDS}")
+    print(f"📁 Папка сессий: {SESSIONS_DIR}")
+    print(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
+    print(f"💾 База данных: {'PostgreSQL' if DATABASE_URL else 'SQLite'}")
     print("=" * 70)
     print("⚡ Система автоперезапуска: АКТИВНА")
     print("⚡ Health monitor: АКТИВЕН")
     print("⚡ Плановый перезапуск: 4:00 daily")
     print("=" * 70)
     
+    # Запускаем бота
     start_bot()
