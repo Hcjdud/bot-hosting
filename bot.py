@@ -1,6 +1,6 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 29.0 (FINAL - ИСПРАВЛЕННАЯ ВЕРСИЯ)
+Версия: 30.0 (FINAL - ИСПРАВЛЕННАЯ ВЕРСИЯ)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
@@ -8,6 +8,8 @@ Telegram Numbers Shop Bot + Session Manager
 - Поддержка двухфакторной аутентификации (2FA)
 - 3 СПОСОБА ПОПОЛНЕНИЯ БАЛАНСА
 - Админ-панель с выдачей звёзд
+- ✅ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА
+- ✅ ПРОВЕРКА УНИКАЛЬНОСТИ ПРОЦЕССА
 - ✅ ТОКЕН ТОЛЬКО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ АДМИНЫ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ КОШЕЛЬКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
@@ -43,6 +45,7 @@ import shutil
 import signal
 import traceback
 import threading
+import fcntl  # Для блокировки файла
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -94,8 +97,17 @@ from pyrogram.errors import (
 # Для веб-сервера
 from aiohttp import web
 
-# Загружаем переменные окружения
-load_dotenv()
+# ================= ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
+# Это предотвращает запуск нескольких экземпляров бота
+
+lock_file = '/tmp/bot.lock'
+try:
+    lock_handle = open(lock_file, 'w')
+    fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("✅ Блокировка получена, продолжаем запуск...")
+except IOError:
+    print("❌ Бот уже запущен! Завершаем работу.")
+    sys.exit(0)
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 logging.basicConfig(
@@ -4753,116 +4765,6 @@ async def stats_logger():
         
         await asyncio.sleep(3600)
 
-async def on_startup(dp):
-    """Действия при запуске бота"""
-    global start_time
-    start_time = time.time()
-    
-    logger.info("🚀 Бот запускается...")
-    
-    try:
-        me = await bot.get_me()
-        logger.info(f"✅ Бот авторизован: @{me.username} (ID: {me.id})")
-    except Unauthorized:
-        logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН! Получите новый у @BotFather")
-        return
-    
-    logger.info(f"📁 Папка сессий: {SESSIONS_DIR}")
-    logger.info(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
-    logger.info(f"📁 Папка медиа: {MEDIA_DIR}")
-    if db.db_url:
-        logger.info(f"📁 База данных: PostgreSQL")
-    else:
-        logger.info(f"📁 База данных: SQLite")
-    
-    # Загружаем сохраненные сессии
-    await session_manager.load_saved_sessions()
-    
-    # Запускаем веб-сервер (функция определена выше)
-    asyncio.create_task(web_server())
-    
-    asyncio.create_task(cleanup_task())
-    asyncio.create_task(stats_logger())
-    asyncio.create_task(health_monitor())
-    asyncio.create_task(scheduled_restart())
-    
-    stats = db.get_stats()
-    welcome_media = db.get_welcome_media()
-    
-    logger.info(f"📊 Начальная статистика: Users={stats['total_users']}, "
-                f"Numbers={stats['available_numbers']}, Accounts={stats['total_accounts']}, "
-                f"Channels={stats['total_channels']}")
-    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'}")
-    
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🚀 <b>Numbers Shop Bot запущен!</b>\n\n"
-                f"📊 <b>Статистика:</b>\n"
-                f"• Пользователей: {stats['total_users']}\n"
-                f"• Номеров в продаже: {stats['available_numbers']}\n"
-                f"• Аккаунтов TG: {stats['active_accounts']}\n"
-                f"• Продано номеров: {stats['sold_numbers']}\n"
-                f"• Каналов подписки: {stats['total_channels']}/{MAX_CHANNELS}\n\n"
-                f"⚙️ <b>Система:</b>\n"
-                f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
-                f"• Медиа в меню: {'✅' if welcome_media else '❌'}\n"
-                f"• Сессии сохраняются: ✅\n"
-                f"• Автоперезапуск: ✅\n"
-                f"• Health monitor: ✅\n"
-                f"• Вечный пинг: ✅\n"
-                f"• Python: {sys.version.split()[0]}\n"
-                f"• API ID: {API_ID}"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
-    
-    logger.info("✅ Бот готов к работе и НИКОГДА НЕ ВЫКЛЮЧИТСЯ!")
-
-async def on_shutdown(dp):
-    """Действия при остановке бота"""
-    global running
-    running = False
-    
-    logger.info("🛑 Бот останавливается...")
-    
-    closed_sessions = 0
-    for phone, client in session_manager.active_sessions.items():
-        try:
-            await client.disconnect()
-            closed_sessions += 1
-        except Exception as e:
-            logger.error(f"❌ Ошибка при закрытии сессии {phone}: {e}")
-    
-    logger.info(f"✅ Закрыто активных сессий: {closed_sessions}")
-    
-    try:
-        if not db.db_url:
-            backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
-            shutil.copy2(db.db_path, backup_file)
-            logger.info(f"✅ Создан финальный бекап: {backup_file}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка создания финального бекапа: {e}")
-    
-    uptime = time.time() - start_time
-    uptime_str = str(timedelta(seconds=int(uptime)))
-    
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🛑 <b>Бот остановлен</b>\n\n"
-                f"⏱ Время работы: {uptime_str}\n"
-                f"✅ Все сессии закрыты, файлы сохранены"
-            )
-        except Exception as e:
-            logger.error(f"❌ Не удалось отправить уведомление: {e}")
-    
-    logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
-
-# ================= МОНИТОРИНГ ЗДОРОВЬЯ =================
-
 async def health_monitor():
     """Мониторинг здоровья бота"""
     global running, last_message_time, ping_count
@@ -4961,6 +4863,124 @@ async def scheduled_restart():
 
 # ================= ЗАПУСК БОТА =================
 
+async def on_startup(dp):
+    """Действия при запуске бота"""
+    global start_time
+    start_time = time.time()
+    
+    # Проверяем, не запущен ли уже бот (дополнительная защита)
+    if hasattr(on_startup, "called") and on_startup.called:
+        logger.warning("⚠️ on_startup уже был вызван, пропускаем...")
+        return
+    on_startup.called = True
+    
+    logger.info("🚀 Бот запускается...")
+    
+    try:
+        me = await bot.get_me()
+        logger.info(f"✅ Бот авторизован: @{me.username} (ID: {me.id})")
+    except Unauthorized:
+        logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН! Получите новый у @BotFather")
+        return
+    
+    logger.info(f"📁 Папка сессий: {SESSIONS_DIR}")
+    logger.info(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
+    logger.info(f"📁 Папка медиа: {MEDIA_DIR}")
+    if db.db_url:
+        logger.info(f"📁 База данных: PostgreSQL")
+    else:
+        logger.info(f"📁 База данных: SQLite")
+    
+    # Загружаем сохраненные сессии
+    await session_manager.load_saved_sessions()
+    
+    # Запускаем веб-сервер
+    asyncio.create_task(web_server())
+    
+    # Запускаем фоновые задачи
+    asyncio.create_task(cleanup_task())
+    asyncio.create_task(stats_logger())
+    asyncio.create_task(health_monitor())
+    asyncio.create_task(scheduled_restart())
+    
+    stats = db.get_stats()
+    welcome_media = db.get_welcome_media()
+    
+    logger.info(f"📊 Начальная статистика: Users={stats['total_users']}, "
+                f"Numbers={stats['available_numbers']}, Accounts={stats['total_accounts']}, "
+                f"Channels={stats['total_channels']}")
+    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'}")
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🚀 <b>Numbers Shop Bot запущен!</b>\n\n"
+                f"📊 <b>Статистика:</b>\n"
+                f"• Пользователей: {stats['total_users']}\n"
+                f"• Номеров в продаже: {stats['available_numbers']}\n"
+                f"• Аккаунтов TG: {stats['active_accounts']}\n"
+                f"• Продано номеров: {stats['sold_numbers']}\n"
+                f"• Каналов подписки: {stats['total_channels']}/{MAX_CHANNELS}\n\n"
+                f"⚙️ <b>Система:</b>\n"
+                f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
+                f"• Медиа в меню: {'✅' if welcome_media else '❌'}\n"
+                f"• Сессии сохраняются: ✅\n"
+                f"• Автоперезапуск: ✅\n"
+                f"• Health monitor: ✅\n"
+                f"• Вечный пинг: ✅\n"
+                f"• Python: {sys.version.split()[0]}\n"
+                f"• API ID: {API_ID}"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+    
+    logger.info("✅ Бот готов к работе!")
+
+# Устанавливаем флаг для проверки повторного вызова
+on_startup.called = False
+
+async def on_shutdown(dp):
+    """Действия при остановке бота"""
+    global running
+    running = False
+    
+    logger.info("🛑 Бот останавливается...")
+    
+    closed_sessions = 0
+    for phone, client in session_manager.active_sessions.items():
+        try:
+            await client.disconnect()
+            closed_sessions += 1
+        except Exception as e:
+            logger.error(f"❌ Ошибка при закрытии сессии {phone}: {e}")
+    
+    logger.info(f"✅ Закрыто активных сессий: {closed_sessions}")
+    
+    try:
+        if not db.db_url:
+            backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
+            shutil.copy2(db.db_path, backup_file)
+            logger.info(f"✅ Создан финальный бекап: {backup_file}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания финального бекапа: {e}")
+    
+    uptime = time.time() - start_time
+    uptime_str = str(timedelta(seconds=int(uptime)))
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🛑 <b>Бот остановлен</b>\n\n"
+                f"⏱ Время работы: {uptime_str}\n"
+                f"✅ Все сессии закрыты, файлы сохранены"
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось отправить уведомление: {e}")
+    
+    logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
+
 def start_bot():
     """Запуск бота с защитой от падений"""
     max_retries = 1000
@@ -4997,7 +5017,7 @@ def start_bot():
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("🚀 Telegram Numbers Shop Bot v29.0 - ИСПРАВЛЕННАЯ ВЕРСИЯ")
+    print("🚀 Telegram Numbers Shop Bot v30.0 - ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
     print("✅ Админы с бесконечным балансом ♾")
     print("✅ Обязательные подписки на каналы (до 5)")
@@ -5006,6 +5026,7 @@ if __name__ == "__main__":
     print("✅ Удаление сессий и номеров")
     print("✅ Сессии СОХРАНЯЮТСЯ в файлы")
     print("✅ Параллельная работа веб-сервера")
+    print("✅ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
     print("=" * 80)
     print(f"👥 Администраторы: {ADMIN_IDS}")
     print(f"📁 Папка сессий: {SESSIONS_DIR}")
