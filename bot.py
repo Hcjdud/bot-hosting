@@ -1,6 +1,6 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 31.1 (FINAL - ИСПРАВЛЕН ВЕБ-СЕРВЕР)
+Версия: 31.3 (FINAL - УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
@@ -10,7 +10,7 @@ Telegram Numbers Shop Bot + Session Manager
 - Админ-панель с выдачей звёзд
 - ✅ МЕДИА ОТКЛЮЧЕНО ДО ЗАГРУЗКИ АДМИНОМ
 - ✅ ЗАГРУЗКА ФОТО И ГИФОК ЧЕРЕЗ АДМИНКУ
-- ✅ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА
+- ✅ УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА
 - ✅ ТОКЕН ТОЛЬКО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ АДМИНЫ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ КОШЕЛЬКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
@@ -27,6 +27,10 @@ Telegram Numbers Shop Bot + Session Manager
 - ✅ СИСТЕМА "ВЕЧНОЙ РАБОТЫ" (НЕ ВЫКЛЮЧАЕТСЯ)
 - ✅ АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК ПРИ СБОЯХ
 - ✅ ПИНГ-СИСТЕМА ДЛЯ RENDER + UPTIMEROBOT
+- ✅ УЛУЧШЕННОЕ ЛОГИРОВАНИЕ ОШИБОК
+- ✅ МОНИТОРИНГ ПАМЯТИ
+- ✅ ДЕТАЛЬНЫЙ CRASH-ЛОГ
+- ✅ ПЛАНОВЫЙ ПЕРЕЗАПУСК ОТКЛЮЧЕН
 - Полный мониторинг и логирование
 - Поддержка PostgreSQL на Render
 """
@@ -46,6 +50,7 @@ import signal
 import traceback
 import threading
 import fcntl  # Для блокировки файла
+import socket  # Для дополнительной проверки порта
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -111,17 +116,68 @@ print(f"   • BOT_TOKEN: {'✅ задан' if os.environ.get('BOT_TOKEN') else 
 print(f"   • ADMIN_IDS: {os.environ.get('ADMIN_IDS', 'не заданы')}")
 print("=" * 50)
 
-# ================= ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
-# Это предотвращает запуск нескольких экземпляров бота
+# ================= УСИЛЕННАЯ ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
 
-lock_file = '/tmp/bot.lock'
-try:
-    lock_handle = open(lock_file, 'w')
-    fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    print("✅ Блокировка получена, продолжаем запуск...")
-except IOError:
-    print("❌ Бот уже запущен! Завершаем работу.")
+def check_single_instance():
+    """Многоуровневая проверка уникальности запуска"""
+    
+    # Уровень 1: Файловая блокировка
+    lock_file = '/tmp/bot.lock'
+    try:
+        lock_handle = open(lock_file, 'w')
+        fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        print("✅ Уровень 1: Файловая блокировка получена")
+    except IOError:
+        print("❌ Уровень 1: Бот уже запущен (файловая блокировка)")
+        return False, "file_lock"
+    
+    # Уровень 2: Проверка процесса по PID
+    try:
+        with open('bot.pid', 'r') as f:
+            old_pid = int(f.read().strip())
+            if psutil.pid_exists(old_pid):
+                # Проверяем, что это действительно наш бот
+                try:
+                    process = psutil.Process(old_pid)
+                    if 'python' in process.name().lower() and 'bot' in ' '.join(process.cmdline()).lower():
+                        print(f"❌ Уровень 2: Процесс с PID {old_pid} уже запущен")
+                        return False, "process_exists"
+                except:
+                    pass
+    except:
+        pass
+    
+    # Сохраняем текущий PID
+    with open('bot.pid', 'w') as f:
+        f.write(str(os.getpid()))
+    print(f"✅ Уровень 2: PID {os.getpid()} сохранен")
+    
+    # Уровень 3: Проверка порта (только для Render)
+    if IS_RENDER:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('127.0.0.1', PORT))
+            if result == 0:
+                # Порт занят, проверяем, не нашим ли процессом
+                for conn in psutil.net_connections():
+                    if conn.laddr.port == PORT and conn.pid != os.getpid():
+                        if psutil.pid_exists(conn.pid):
+                            print(f"❌ Уровень 3: Порт {PORT} занят процессом {conn.pid}")
+                            return False, "port_in_use"
+            sock.close()
+        except Exception as e:
+            print(f"⚠️ Уровень 3: Ошибка проверки порта: {e}")
+    
+    return True, "ok"
+
+# Выполняем проверку
+is_unique, reason = check_single_instance()
+if not is_unique:
+    print(f"❌ Бот уже запущен! Причина: {reason}")
+    print("💡 Убедитесь, что на Render запущен только один экземпляр")
     sys.exit(0)
+
+print("✅ Все проверки уникальности пройдены")
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 logging.basicConfig(
@@ -129,7 +185,8 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('bot.log')
+        logging.FileHandler('bot.log'),
+        logging.FileHandler('crash.log')  # Добавляем отдельный файл для критических ошибок
     ]
 )
 logger = logging.getLogger(__name__)
@@ -347,7 +404,9 @@ async def health_check(request):
         'port': PORT,
         'time': time.time(),
         'ping': ping_count,
-        'uptime': time.time() - start_time if 'start_time' in globals() else 0
+        'uptime': time.time() - start_time if 'start_time' in globals() else 0,
+        'memory': psutil.virtual_memory().percent if 'psutil' in globals() else 0,
+        'pid': os.getpid()
     })
 
 async def payment_webhook(request):
@@ -475,6 +534,8 @@ max_restarts = 1000
 restart_window = 3600
 restart_times = []
 uptime_start = time.time()
+shutdown_reason = "normal"
+restart_initiated_by = None
 
 # Фоновый поток для внутреннего пинга (дополнительная защита)
 def keep_alive_ping():
@@ -509,13 +570,17 @@ def should_restart():
     restart_times.append(current_time)
     return True
 
-def restart_bot():
-    """Принудительный перезапуск бота"""
+def restart_bot(reason="unknown"):
+    """Принудительный перезапуск бота с указанием причины"""
+    global restart_initiated_by, shutdown_reason
+    restart_initiated_by = reason
+    shutdown_reason = reason
+    
     if not should_restart():
         logger.critical("❌ Достигнут лимит перезапусков, бот останавливается")
         sys.exit(1)
     
-    logger.info("🔄 Перезапуск бота через 3 секунды...")
+    logger.info(f"🔄 Перезапуск бота через 3 секунды... Причина: {reason}")
     time.sleep(3)
     
     # Сохраняем данные перед перезапуском
@@ -525,16 +590,32 @@ def restart_bot():
     except Exception as e:
         logger.error(f"❌ Ошибка при сохранении перед перезапуском: {e}")
     
+    # Удаляем PID файл перед перезапуском
+    try:
+        if os.path.exists('bot.pid'):
+            os.remove('bot.pid')
+    except:
+        pass
+    
     # Полный перезапуск процесса
     python = sys.executable
     os.execl(python, python, *sys.argv)
 
 def signal_handler(sig, frame):
     """Обработчик сигналов"""
-    global running, ping_active
+    global running, ping_active, shutdown_reason
     logger.info(f"📡 Получен сигнал {sig}, завершаем работу...")
     running = False
     ping_active = False
+    shutdown_reason = f"signal_{sig}"
+    
+    # Удаляем PID файл
+    try:
+        if os.path.exists('bot.pid'):
+            os.remove('bot.pid')
+    except:
+        pass
+    
     # Даем время на завершение
     time.sleep(2)
     sys.exit(0)
@@ -542,27 +623,125 @@ def signal_handler(sig, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
+# ================= УЛУЧШЕННЫЙ ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ИСКЛЮЧЕНИЙ =================
+
 def global_exception_handler(exc_type, exc_value, exc_traceback):
-    """Глобальный обработчик исключений"""
+    """Глобальный обработчик исключений с подробным логированием"""
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
     
-    logger.error("❌ НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ:", exc_info=(exc_type, exc_value, exc_traceback))
+    # Подробное логирование ошибки
+    error_msg = f"❌ НЕОБРАБОТАННОЕ ИСКЛЮЧЕНИЕ: {exc_type.__name__}: {exc_value}"
+    logger.error(error_msg)
+    logger.error("".join(traceback.format_tb(exc_traceback)))
+    
+    # Записываем в файл для анализа
+    with open('crash.log', 'a', encoding='utf-8') as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"--- {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        f.write(f"Type: {exc_type.__name__}\n")
+        f.write(f"Value: {exc_value}\n")
+        f.write("Traceback:\n")
+        f.write("".join(traceback.format_tb(exc_traceback)))
+        f.write(f"\n{'='*60}\n")
     
     # Пытаемся отправить уведомление админу
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        loop.run_until_complete(notify_admin_crash(exc_type, exc_value))
+        loop.run_until_complete(notify_admin_crash(exc_type, exc_value, exc_traceback))
         loop.close()
     except Exception as e:
         logger.error(f"❌ Не удалось отправить уведомление админу: {e}")
     
     # Перезапускаемся
-    restart_bot()
+    restart_bot(f"exception_{exc_type.__name__}")
 
 sys.excepthook = global_exception_handler
+
+async def notify_admin_crash(exc_type, exc_value, exc_traceback):
+    """Уведомление админа о падении с деталями"""
+    try:
+        # Форматируем трейсбек для отправки
+        tb_lines = traceback.format_tb(exc_traceback)
+        tb_text = "".join(tb_lines[-5:])  # Последние 5 строк
+        
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ <b>Бот упал с ошибкой!</b>\n\n"
+                    f"<b>Тип:</b> {exc_type.__name__}\n"
+                    f"<b>Ошибка:</b> {str(exc_value)[:200]}\n\n"
+                    f"<b>Где:</b>\n<code>{tb_text[:500]}</code>\n\n"
+                    f"🔄 Автоматический перезапуск через 3 секунды..."
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при отправке уведомления: {e}")
+
+# ================= ОБРАБОТЧИК ОШИБОК AIOGRAM =================
+
+@dp.errors_handler()
+async def errors_handler(update, exception):
+    """Обработчик ошибок aiogram"""
+    try:
+        raise exception
+    except TerminatedByOtherGetUpdates:
+        logger.error("❌ КРИТИЧЕСКАЯ ОШИБКА: Запущено несколько экземпляров бота!")
+        
+        # Записываем в crash.log
+        with open('crash.log', 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"--- КРИТИЧЕСКАЯ ОШИБКА {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write("TerminatedByOtherGetUpdates: Запущено несколько экземпляров бота!\n")
+            f.write(f"PID: {os.getpid()}\n")
+            f.write(f"{'='*60}\n")
+        
+        # Уведомляем админа
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"❌ <b>КРИТИЧЕСКАЯ ОШИБКА!</b>\n\n"
+                    f"Запущено несколько экземпляров бота!\n"
+                    f"PID текущего процесса: {os.getpid()}\n\n"
+                    f"Бот будет перезапущен через 3 секунды..."
+                )
+            except:
+                pass
+        
+        # Перезапускаемся
+        restart_bot("multiple_instances")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка в обработчике: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Записываем в crash.log
+        with open('crash.log', 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"--- AIOGRAM ERROR {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+            f.write(f"Update: {update}\n")
+            f.write(f"Exception: {type(e).__name__}: {e}\n")
+            f.write(f"Traceback:\n{traceback.format_exc()}\n")
+            f.write(f"{'='*60}\n")
+        
+        # Уведомляем админа о ошибке
+        for admin_id in ADMIN_IDS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"⚠️ <b>Ошибка в боте</b>\n\n"
+                    f"<b>Тип:</b> {type(e).__name__}\n"
+                    f"<b>Ошибка:</b> {str(e)[:200]}"
+                )
+            except:
+                pass
+    
+    return True
 
 def protect_coro(coro):
     """Декоратор для защиты корутин от падений"""
@@ -576,20 +755,6 @@ def protect_coro(coro):
             # Не падаем, просто возвращаем None
             return None
     return wrapper
-
-async def notify_admin_crash(exc_type, exc_value):
-    """Уведомление админа о падении"""
-    try:
-        for admin_id in ADMIN_IDS:
-            await bot.send_message(
-                admin_id,
-                f"⚠️ <b>Бот упал с ошибкой!</b>\n\n"
-                f"Тип: {exc_type.__name__}\n"
-                f"Ошибка: {str(exc_value)[:200]}\n\n"
-                f"🔄 Автоматический перезапуск через 3 секунды..."
-            )
-    except Exception as e:
-        logger.error(f"❌ Не удалось отправить уведомление: {e}")
 
 # ================= ФУНКЦИИ ДЛЯ ПРОВЕРКИ АДМИНОВ =================
 
@@ -3791,10 +3956,15 @@ async def admin_panel(callback: CallbackQuery):
     welcome_media = db.get_welcome_media()
     media_status = "✅ Есть" if welcome_media else "❌ Нет"
     
+    # Добавляем информацию о памяти
+    memory_info = psutil.virtual_memory()
+    swap_info = psutil.swap_memory()
+    
     text = f"""
 ⚙️ <b>Админ-панель</b>
 
 👤 <b>Администратор:</b> @{callback.from_user.username}
+🆔 <b>PID процесса:</b> {os.getpid()}
 
 📊 <b>Статистика магазина:</b>
 • 👥 Пользователей: {stats['total_users']}
@@ -3808,7 +3978,8 @@ async def admin_panel(callback: CallbackQuery):
 
 🖥 <b>Система:</b>
 • 🔥 CPU: {cpu_percent}%
-• 💾 RAM: {memory.percent}%
+• 💾 RAM: {memory.percent}% ({memory.used/1024/1024:.0f}MB / {memory.total/1024/1024:.0f}MB)
+• 🔄 Swap: {swap_info.percent}% ({swap_info.used/1024/1024:.0f}MB / {swap_info.total/1024/1024:.0f}MB)
 • 💽 Диск: {disk.percent}%
 • ⏱ Uptime: {timedelta(seconds=int(uptime))}
 • 🏓 Пингов: {ping_count_global}
@@ -3818,6 +3989,7 @@ async def admin_panel(callback: CallbackQuery):
 • 💾 Сессии сохраняются: ✅
 • 📡 UptimeRobot: ✅ (каждые 5 минут)
 • 🔧 Веб-сервер: ✅ (не блокирует бота)
+• 🛡 Защита от двойного запуска: ✅ (усиленная)
 
 Выберите действие:
 """
@@ -3847,7 +4019,7 @@ async def admin_restart(callback: CallbackQuery):
             logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
     
     await asyncio.sleep(3)
-    restart_bot()
+    restart_bot("admin_request")
 
 @dp.callback_query_handler(lambda c: c.data == 'admin_accounts')
 async def admin_accounts(callback: CallbackQuery):
@@ -4785,6 +4957,50 @@ async def show_transactions(callback: CallbackQuery):
         )
     )
 
+# ================= МОНИТОРИНГ ПАМЯТИ =================
+
+async def memory_monitor():
+    """Мониторинг использования памяти"""
+    while running:
+        try:
+            memory = psutil.virtual_memory()
+            if memory.percent > 80:  # Если память > 80%
+                logger.warning(f"⚠️ Высокое использование памяти: {memory.percent}%")
+                
+                # Отправляем предупреждение админу
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"⚠️ <b>Предупреждение о памяти</b>\n\n"
+                            f"Использование памяти: {memory.percent}%\n"
+                            f"Доступно: {memory.available / 1024 / 1024:.0f} MB"
+                        )
+                    except:
+                        pass
+            
+            if memory.percent > 95:  # Критическое использование
+                logger.critical(f"❌ Критическое использование памяти: {memory.percent}%")
+                
+                # Уведомляем админа перед перезапуском
+                for admin_id in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"❌ <b>Критическое использование памяти!</b>\n\n"
+                            f"Использование: {memory.percent}%\n"
+                            f"Бот будет перезапущен..."
+                        )
+                    except:
+                        pass
+                
+                restart_bot("memory_critical")
+                
+        except Exception as e:
+            logger.error(f"Ошибка в memory_monitor: {e}")
+        
+        await asyncio.sleep(60)  # Проверяем каждую минуту
+
 # ================= ИСПРАВЛЕННЫЙ ON_STARTUP =================
 
 async def on_startup(dp):
@@ -4829,7 +5045,8 @@ async def on_startup(dp):
     asyncio.create_task(cleanup_task())
     asyncio.create_task(stats_logger())
     asyncio.create_task(health_monitor())
-    asyncio.create_task(scheduled_restart())
+    asyncio.create_task(memory_monitor())  # Добавляем монитор памяти
+    # Плановый перезапуск ОТКЛЮЧЕН
     
     stats = db.get_stats()
     welcome_media = db.get_welcome_media()
@@ -4865,7 +5082,10 @@ async def on_startup(dp):
                 f"• Внешний самопинг: ✅ (каждые 45 сек)\n"
                 f"• UptimeRobot: ✅ (каждые 5 минут)\n"
                 f"• Health monitor: ✅\n"
+                f"• Memory monitor: ✅\n"
+                f"• Плановый перезапуск: ❌ (отключен)\n"
                 f"• Веб-сервер: ✅ (не блокирует бота)\n"
+                f"• Защита от двойного запуска: ✅ (усиленная)\n"
                 f"• Python: {sys.version.split()[0]}\n"
                 f"• API ID: {API_ID}\n\n"
                 f"🌐 <b>Внешний URL:</b> {RENDER_EXTERNAL_URL or 'Не настроен'}\n"
@@ -4883,11 +5103,19 @@ on_startup.called = False
 
 async def on_shutdown(dp):
     """Действия при остановке бота"""
-    global running, ping_active, web_runner
+    global running, ping_active, web_runner, shutdown_reason
     running = False
     ping_active = False
     
-    logger.info("🛑 Бот останавливается...")
+    logger.info(f"🛑 Бот останавливается. Причина: {shutdown_reason}")
+    
+    # Записываем причину остановки в crash.log
+    with open('crash.log', 'a', encoding='utf-8') as f:
+        f.write(f"\n{'='*60}\n")
+        f.write(f"--- SHUTDOWN {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        f.write(f"Reason: {shutdown_reason}\n")
+        f.write(f"Uptime: {time.time() - start_time:.0f} seconds\n")
+        f.write(f"{'='*60}\n")
     
     # Останавливаем веб-сервер
     if web_runner:
@@ -4915,6 +5143,13 @@ async def on_shutdown(dp):
     except Exception as e:
         logger.error(f"❌ Ошибка создания финального бекапа: {e}")
     
+    # Удаляем PID файл
+    try:
+        if os.path.exists('bot.pid'):
+            os.remove('bot.pid')
+    except:
+        pass
+    
     uptime = time.time() - start_time
     uptime_str = str(timedelta(seconds=int(uptime)))
     
@@ -4924,6 +5159,7 @@ async def on_shutdown(dp):
                 admin_id,
                 f"🛑 <b>Бот остановлен</b>\n\n"
                 f"⏱ Время работы: {uptime_str}\n"
+                f"❓ Причина: {shutdown_reason}\n"
                 f"✅ Все сессии закрыты, файлы сохранены\n"
                 f"🏓 Всего внутренних пингов: {ping_count}\n"
                 f"🌐 Внешний самопинг остановлен"
@@ -4931,11 +5167,10 @@ async def on_shutdown(dp):
         except Exception as e:
             logger.error(f"❌ Не удалось отправить уведомление: {e}")
     
-    logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
+    logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}, причина: {shutdown_reason}")
 
-# ================= ЗАПУСК БОТА =================
+# ================= ФОНОВЫЕ ЗАДАЧИ =================
 
-# Фоновые задачи
 async def cleanup_task():
     """Периодическая очистка сессий"""
     while running:
@@ -4977,17 +5212,26 @@ async def stats_logger():
 
 async def health_monitor():
     """Мониторинг здоровья бота"""
-    global running, last_message_time, ping_count
+    global running, last_message_time, ping_count, shutdown_reason
     
     error_count = 0
     max_errors = 5
+    last_restart_time = time.time()
+    min_restart_interval = 300  # Минимум 5 минут между перезапусками
     
     while running:
         try:
+            current_time = time.time()
+            
+            # Проверяем, не слишком ли часто перезапускаемся
+            if current_time - last_restart_time < min_restart_interval:
+                logger.warning(f"⚠️ Слишком частый перезапуск, ждем {min_restart_interval - (current_time - last_restart_time)} сек")
+                await asyncio.sleep(10)
+                continue
+            
             # Проверяем, отвечает ли бот
             me = await bot.get_me()
             
-            current_time = time.time()
             if current_time - last_message_time > 300:
                 logger.warning("⚠️ Бот неактивен 5 минут, проверка...")
                 
@@ -5016,6 +5260,7 @@ async def health_monitor():
                 logger.error(f"❌ Ошибка при проверке сессий: {e}")
             
             if error_count >= max_errors:
+                shutdown_reason = f"too_many_errors_{error_count}"
                 logger.error(f"❌ Слишком много ошибок ({error_count}), перезапуск...")
                 
                 try:
@@ -5027,7 +5272,8 @@ async def health_monitor():
                 except Exception as e:
                     logger.error(f"❌ Не удалось отправить уведомление: {e}")
                 
-                restart_bot()
+                last_restart_time = current_time
+                restart_bot(shutdown_reason)
             
             await asyncio.sleep(60)
             
@@ -5036,38 +5282,7 @@ async def health_monitor():
             error_count += 1
             await asyncio.sleep(30)
 
-async def scheduled_restart():
-    """Плановый перезапуск бота каждый день в 4 утра"""
-    global running
-    
-    while running:
-        try:
-            now = datetime.now()
-            next_restart = now.replace(hour=4, minute=0, second=0, microsecond=0)
-            if now >= next_restart:
-                next_restart += timedelta(days=1)
-            
-            wait_seconds = (next_restart - now).total_seconds()
-            logger.info(f"⏰ Следующий плановый перезапуск через {wait_seconds/3600:.1f} часов")
-            
-            await asyncio.sleep(wait_seconds)
-            
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(
-                        admin_id,
-                        "🔄 <b>Плановый перезапуск бота</b>\n\n"
-                        "Бот будет перезапущен для обновления. Ожидайте 10 секунд..."
-                    )
-                except Exception as e:
-                    logger.error(f"❌ Не удалось отправить уведомление: {e}")
-            
-            logger.info("🔄 Плановый перезапуск...")
-            restart_bot()
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка в scheduled_restart: {e}")
-            await asyncio.sleep(3600)
+# ================= ЗАПУСК БОТА =================
 
 def start_bot():
     """Запуск бота с защитой от падений"""
@@ -5105,7 +5320,7 @@ def start_bot():
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("🚀 Telegram Numbers Shop Bot v31.1 - ИСПРАВЛЕН ВЕБ-СЕРВЕР")
+    print("🚀 Telegram Numbers Shop Bot v31.3 - УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
     print("✅ Админы с бесконечным балансом ♾")
     print("✅ Обязательные подписки на каналы (до 5)")
@@ -5114,7 +5329,8 @@ if __name__ == "__main__":
     print("✅ Удаление сессий и номеров")
     print("✅ Сессии СОХРАНЯЮТСЯ в файлы")
     print("✅ Параллельная работа веб-сервера (НЕ БЛОКИРУЕТ БОТА)")
-    print("✅ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
+    print("✅ УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА (3 уровня)")
+    print("✅ ПЛАНОВЫЙ ПЕРЕЗАПУСК ОТКЛЮЧЕН")
     print("=" * 80)
     print(f"👥 Администраторы: {ADMIN_IDS}")
     print(f"📁 Папка сессий: {SESSIONS_DIR}")
@@ -5131,8 +5347,9 @@ if __name__ == "__main__":
     print("   • Внешний самопинг каждые 45 сек")
     print("   • UptimeRobot мониторинг каждые 5 минут")
     print("   • Health monitor каждую минуту")
+    print("   • Memory monitor каждую минуту")
     print("   • Автоперезапуск при сбоях")
-    print("   • Плановый перезапуск в 4:00")
+    print("   • Плановый перезапуск ОТКЛЮЧЕН")
     print("   • 1000 попыток перезапуска")
     print("=" * 80)
     
