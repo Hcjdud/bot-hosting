@@ -1,6 +1,6 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 31.0 (FINAL - МЕДИА ОТКЛЮЧЕНО ДО ЗАГРУЗКИ)
+Версия: 31.1 (FINAL - ИСПРАВЛЕН ВЕБ-СЕРВЕР)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
@@ -23,7 +23,7 @@ Telegram Numbers Shop Bot + Session Manager
 - ✅ АДМИНЫ ИМЕЮТ БЕСКОНЕЧНЫЙ БАЛАНС (♾)
 - ✅ УДАЛЕНИЕ СЕССИЙ И НОМЕРОВ
 - ✅ СЕССИИ СОХРАНЯЮТСЯ В ФАЙЛЫ
-- ✅ ПАРАЛЛЕЛЬНАЯ РАБОТА ВЕБ-СЕРВЕРА И БОТА
+- ✅ ПАРАЛЛЕЛЬНАЯ РАБОТА ВЕБ-СЕРВЕРА И БОТА (ИСПРАВЛЕНО)
 - ✅ СИСТЕМА "ВЕЧНОЙ РАБОТЫ" (НЕ ВЫКЛЮЧАЕТСЯ)
 - ✅ АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК ПРИ СБОЯХ
 - ✅ ПИНГ-СИСТЕМА ДЛЯ RENDER + UPTIMEROBOT
@@ -99,6 +99,17 @@ from aiohttp import web
 
 # Загружаем переменные окружения
 load_dotenv()
+
+# ================= ДИАГНОСТИКА =================
+print("🔍 Запуск диагностики...")
+print(f"📌 Текущая директория: {os.getcwd()}")
+print(f"📌 Python версия: {sys.version}")
+print(f"📌 Переменные окружения:")
+print(f"   • PORT: {os.environ.get('PORT', 'не задан')}")
+print(f"   • RENDER_EXTERNAL_URL: {os.environ.get('RENDER_EXTERNAL_URL', 'не задан')}")
+print(f"   • BOT_TOKEN: {'✅ задан' if os.environ.get('BOT_TOKEN') else '❌ не задан'}")
+print(f"   • ADMIN_IDS: {os.environ.get('ADMIN_IDS', 'не заданы')}")
+print("=" * 50)
 
 # ================= ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
 # Это предотвращает запуск нескольких экземпляров бота
@@ -313,7 +324,10 @@ def start_external_ping():
 # Запускаем внешний самопинг
 external_ping_thread = start_external_ping()
 
-# ================= ПРОСТОЙ И НАДЕЖНЫЙ ВЕБ-СЕРВЕР =================
+# ================= ИСПРАВЛЕННЫЙ ВЕБ-СЕРВЕР =================
+
+# Глобальная переменная для веб-сервера
+web_runner = None
 
 async def handle(request):
     """Главная страница"""
@@ -390,7 +404,8 @@ async def payment_webhook(request):
         return web.Response(status=500)
 
 async def web_server():
-    """Максимально простой веб-сервер"""
+    """Веб-сервер - НЕ БЛОКИРУЕТ выполнение"""
+    global web_runner
     app = web.Application()
     
     # Только самые нужные эндпоинты
@@ -398,11 +413,11 @@ async def web_server():
     app.router.add_get('/health', health_check)
     app.router.add_post('/api/cryptobot/webhook', payment_webhook)
     
-    runner = web.AppRunner(app)
-    await runner.setup()
+    web_runner = web.AppRunner(app)
+    await web_runner.setup()
     
     # Явно указываем хост 0.0.0.0 и порт из переменной окружения
-    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    site = web.TCPSite(web_runner, '0.0.0.0', PORT)
     await site.start()
     
     # Выводим в логи критически важную информацию
@@ -414,9 +429,9 @@ async def web_server():
         print(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
         print(f"📡 Для UptimeRobot: {RENDER_EXTERNAL_URL}/health")
     
-    # Бесконечное ожидание
-    while True:
-        await asyncio.sleep(3600)
+    # ВАЖНО: Не делаем бесконечный цикл!
+    # Просто возвращаемся, веб-сервер продолжает работу в фоне
+    return web_runner
 
 # ================= ИНИЦИАЛИЗАЦИЯ БОТА =================
 storage = MemoryStorage()
@@ -3802,6 +3817,7 @@ async def admin_panel(callback: CallbackQuery):
 • 🔄 Автоперезапуск: ✅
 • 💾 Сессии сохраняются: ✅
 • 📡 UptimeRobot: ✅ (каждые 5 минут)
+• 🔧 Веб-сервер: ✅ (не блокирует бота)
 
 Выберите действие:
 """
@@ -4769,10 +4785,157 @@ async def show_transactions(callback: CallbackQuery):
         )
     )
 
-# ================= ЗАПУСК =================
+# ================= ИСПРАВЛЕННЫЙ ON_STARTUP =================
 
-start_time = time.time()
+async def on_startup(dp):
+    """Действия при запуске бота"""
+    global start_time, web_runner
+    start_time = time.time()
+    
+    # Проверяем, не запущен ли уже бот (дополнительная защита)
+    if hasattr(on_startup, "called") and on_startup.called:
+        logger.warning("⚠️ on_startup уже был вызван, пропускаем...")
+        return
+    on_startup.called = True
+    
+    logger.info("🚀 Бот запускается...")
+    
+    try:
+        me = await bot.get_me()
+        logger.info(f"✅ Бот авторизован: @{me.username} (ID: {me.id})")
+    except Unauthorized:
+        logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН! Получите новый у @BotFather")
+        return
+    
+    logger.info(f"📁 Папка сессий: {SESSIONS_DIR}")
+    logger.info(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
+    logger.info(f"📁 Папка медиа: {MEDIA_DIR}")
+    if db.db_url:
+        logger.info(f"📁 База данных: PostgreSQL")
+    else:
+        logger.info(f"📁 База данных: SQLite")
+    
+    # Запускаем веб-сервер (не ждем его завершения)
+    try:
+        asyncio.create_task(web_server())
+        logger.info("✅ Веб-сервер запущен в фоновом режиме")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
+    
+    # Загружаем сохраненные сессии
+    await session_manager.load_saved_sessions()
+    
+    # Запускаем фоновые задачи
+    asyncio.create_task(cleanup_task())
+    asyncio.create_task(stats_logger())
+    asyncio.create_task(health_monitor())
+    asyncio.create_task(scheduled_restart())
+    
+    stats = db.get_stats()
+    welcome_media = db.get_welcome_media()
+    
+    logger.info(f"📊 Начальная статистика: Users={stats['total_users']}, "
+                f"Numbers={stats['available_numbers']}, Accounts={stats['total_accounts']}, "
+                f"Channels={stats['total_channels']}")
+    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'} (отключено до загрузки)")
+    logger.info(f"🏓 Внутренняя пинг-система активна (каждые 30 секунд)")
+    
+    if RENDER_EXTERNAL_URL:
+        logger.info(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
+        logger.info(f"📡 Для UptimeRobot используйте: {RENDER_EXTERNAL_URL}/health")
+        logger.info(f"✅ Внешний самопинг активен (каждые 45 секунд)")
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🚀 <b>Numbers Shop Bot запущен!</b>\n\n"
+                f"📊 <b>Статистика:</b>\n"
+                f"• Пользователей: {stats['total_users']}\n"
+                f"• Номеров в продаже: {stats['available_numbers']}\n"
+                f"• Аккаунтов TG: {stats['active_accounts']}\n"
+                f"• Продано номеров: {stats['sold_numbers']}\n"
+                f"• Каналов подписки: {stats['total_channels']}/{MAX_CHANNELS}\n\n"
+                f"⚙️ <b>Система:</b>\n"
+                f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
+                f"• Медиа в меню: {'✅' if welcome_media else '❌'} (ждет загрузки)\n"
+                f"• Сессии сохраняются: ✅\n"
+                f"• Автоперезапуск: ✅\n"
+                f"• Внутренний пинг: ✅ (каждые 30 сек)\n"
+                f"• Внешний самопинг: ✅ (каждые 45 сек)\n"
+                f"• UptimeRobot: ✅ (каждые 5 минут)\n"
+                f"• Health monitor: ✅\n"
+                f"• Веб-сервер: ✅ (не блокирует бота)\n"
+                f"• Python: {sys.version.split()[0]}\n"
+                f"• API ID: {API_ID}\n\n"
+                f"🌐 <b>Внешний URL:</b> {RENDER_EXTERNAL_URL or 'Не настроен'}\n"
+                f"📡 <b>Для UptimeRobot добавьте:</b> {RENDER_EXTERNAL_URL}/health"
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+    
+    logger.info("✅ Бот готов к работе!")
 
+# Устанавливаем флаг для проверки повторного вызова
+on_startup.called = False
+
+# ================= ИСПРАВЛЕННЫЙ ON_SHUTDOWN =================
+
+async def on_shutdown(dp):
+    """Действия при остановке бота"""
+    global running, ping_active, web_runner
+    running = False
+    ping_active = False
+    
+    logger.info("🛑 Бот останавливается...")
+    
+    # Останавливаем веб-сервер
+    if web_runner:
+        try:
+            await web_runner.cleanup()
+            logger.info("✅ Веб-сервер остановлен")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при остановке веб-сервера: {e}")
+    
+    closed_sessions = 0
+    for phone, client in session_manager.active_sessions.items():
+        try:
+            await client.disconnect()
+            closed_sessions += 1
+        except Exception as e:
+            logger.error(f"❌ Ошибка при закрытии сессии {phone}: {e}")
+    
+    logger.info(f"✅ Закрыто активных сессий: {closed_sessions}")
+    
+    try:
+        if not db.db_url:
+            backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
+            shutil.copy2(db.db_path, backup_file)
+            logger.info(f"✅ Создан финальный бекап: {backup_file}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания финального бекапа: {e}")
+    
+    uptime = time.time() - start_time
+    uptime_str = str(timedelta(seconds=int(uptime)))
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                f"🛑 <b>Бот остановлен</b>\n\n"
+                f"⏱ Время работы: {uptime_str}\n"
+                f"✅ Все сессии закрыты, файлы сохранены\n"
+                f"🏓 Всего внутренних пингов: {ping_count}\n"
+                f"🌐 Внешний самопинг остановлен"
+            )
+        except Exception as e:
+            logger.error(f"❌ Не удалось отправить уведомление: {e}")
+    
+    logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
+
+# ================= ЗАПУСК БОТА =================
+
+# Фоновые задачи
 async def cleanup_task():
     """Периодическая очистка сессий"""
     while running:
@@ -4873,8 +5036,6 @@ async def health_monitor():
             error_count += 1
             await asyncio.sleep(30)
 
-# ================= ПЛАНОВЫЙ ПЕРЕЗАПУСК =================
-
 async def scheduled_restart():
     """Плановый перезапуск бота каждый день в 4 утра"""
     global running
@@ -4907,139 +5068,6 @@ async def scheduled_restart():
         except Exception as e:
             logger.error(f"❌ Ошибка в scheduled_restart: {e}")
             await asyncio.sleep(3600)
-
-# ================= ЗАПУСК БОТА =================
-
-async def on_startup(dp):
-    """Действия при запуске бота"""
-    global start_time
-    start_time = time.time()
-    
-    # Проверяем, не запущен ли уже бот (дополнительная защита)
-    if hasattr(on_startup, "called") and on_startup.called:
-        logger.warning("⚠️ on_startup уже был вызван, пропускаем...")
-        return
-    on_startup.called = True
-    
-    logger.info("🚀 Бот запускается...")
-    
-    try:
-        me = await bot.get_me()
-        logger.info(f"✅ Бот авторизован: @{me.username} (ID: {me.id})")
-    except Unauthorized:
-        logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН! Получите новый у @BotFather")
-        return
-    
-    logger.info(f"📁 Папка сессий: {SESSIONS_DIR}")
-    logger.info(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
-    logger.info(f"📁 Папка медиа: {MEDIA_DIR}")
-    if db.db_url:
-        logger.info(f"📁 База данных: PostgreSQL")
-    else:
-        logger.info(f"📁 База данных: SQLite")
-    
-    # Загружаем сохраненные сессии
-    await session_manager.load_saved_sessions()
-    
-    # Запускаем веб-сервер
-    asyncio.create_task(web_server())
-    
-    # Запускаем фоновые задачи
-    asyncio.create_task(cleanup_task())
-    asyncio.create_task(stats_logger())
-    asyncio.create_task(health_monitor())
-    asyncio.create_task(scheduled_restart())
-    
-    stats = db.get_stats()
-    welcome_media = db.get_welcome_media()
-    
-    logger.info(f"📊 Начальная статистика: Users={stats['total_users']}, "
-                f"Numbers={stats['available_numbers']}, Accounts={stats['total_accounts']}, "
-                f"Channels={stats['total_channels']}")
-    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'} (отключено до загрузки)")
-    logger.info(f"🏓 Внутренняя пинг-система активна (каждые 30 секунд)")
-    
-    if RENDER_EXTERNAL_URL:
-        logger.info(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
-        logger.info(f"📡 Для UptimeRobot используйте: {RENDER_EXTERNAL_URL}/health")
-        logger.info(f"✅ Внешний самопинг активен (каждые 45 секунд)")
-    
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🚀 <b>Numbers Shop Bot запущен!</b>\n\n"
-                f"📊 <b>Статистика:</b>\n"
-                f"• Пользователей: {stats['total_users']}\n"
-                f"• Номеров в продаже: {stats['available_numbers']}\n"
-                f"• Аккаунтов TG: {stats['active_accounts']}\n"
-                f"• Продано номеров: {stats['sold_numbers']}\n"
-                f"• Каналов подписки: {stats['total_channels']}/{MAX_CHANNELS}\n\n"
-                f"⚙️ <b>Система:</b>\n"
-                f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
-                f"• Медиа в меню: {'✅' if welcome_media else '❌'} (ждет загрузки)\n"
-                f"• Сессии сохраняются: ✅\n"
-                f"• Автоперезапуск: ✅\n"
-                f"• Внутренний пинг: ✅ (каждые 30 сек)\n"
-                f"• Внешний самопинг: ✅ (каждые 45 сек)\n"
-                f"• UptimeRobot: ✅ (каждые 5 минут)\n"
-                f"• Health monitor: ✅\n"
-                f"• Python: {sys.version.split()[0]}\n"
-                f"• API ID: {API_ID}\n\n"
-                f"🌐 <b>Внешний URL:</b> {RENDER_EXTERNAL_URL or 'Не настроен'}\n"
-                f"📡 <b>Для UptimeRobot добавьте:</b> {RENDER_EXTERNAL_URL}/health"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
-    
-    logger.info("✅ Бот готов к работе!")
-
-# Устанавливаем флаг для проверки повторного вызова
-on_startup.called = False
-
-async def on_shutdown(dp):
-    """Действия при остановке бота"""
-    global running, ping_active
-    running = False
-    ping_active = False
-    
-    logger.info("🛑 Бот останавливается...")
-    
-    closed_sessions = 0
-    for phone, client in session_manager.active_sessions.items():
-        try:
-            await client.disconnect()
-            closed_sessions += 1
-        except Exception as e:
-            logger.error(f"❌ Ошибка при закрытии сессии {phone}: {e}")
-    
-    logger.info(f"✅ Закрыто активных сессий: {closed_sessions}")
-    
-    try:
-        if not db.db_url:
-            backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
-            shutil.copy2(db.db_path, backup_file)
-            logger.info(f"✅ Создан финальный бекап: {backup_file}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка создания финального бекапа: {e}")
-    
-    uptime = time.time() - start_time
-    uptime_str = str(timedelta(seconds=int(uptime)))
-    
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(
-                admin_id,
-                f"🛑 <b>Бот остановлен</b>\n\n"
-                f"⏱ Время работы: {uptime_str}\n"
-                f"✅ Все сессии закрыты, файлы сохранены\n"
-                f"🏓 Всего внутренних пингов: {ping_count}\n"
-                f"🌐 Внешний самопинг остановлен"
-            )
-        except Exception as e:
-            logger.error(f"❌ Не удалось отправить уведомление: {e}")
-    
-    logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}")
 
 def start_bot():
     """Запуск бота с защитой от падений"""
@@ -5077,7 +5105,7 @@ def start_bot():
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("🚀 Telegram Numbers Shop Bot v31.0 - МЕДИА ОТКЛЮЧЕНО ДО ЗАГРУЗКИ")
+    print("🚀 Telegram Numbers Shop Bot v31.1 - ИСПРАВЛЕН ВЕБ-СЕРВЕР")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
     print("✅ Админы с бесконечным балансом ♾")
     print("✅ Обязательные подписки на каналы (до 5)")
@@ -5085,7 +5113,7 @@ if __name__ == "__main__":
     print("✅ Загрузка фото и GIF в главное меню (ЧЕРЕЗ АДМИНКУ)")
     print("✅ Удаление сессий и номеров")
     print("✅ Сессии СОХРАНЯЮТСЯ в файлы")
-    print("✅ Параллельная работа веб-сервера")
+    print("✅ Параллельная работа веб-сервера (НЕ БЛОКИРУЕТ БОТА)")
     print("✅ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
     print("=" * 80)
     print(f"👥 Администраторы: {ADMIN_IDS}")
