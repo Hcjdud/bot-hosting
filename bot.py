@@ -132,6 +132,9 @@ RENDER_SERVICE_URL = os.environ.get('RENDER_SERVICE_URL', RENDER_EXTERNAL_URL)
 PORT = int(os.environ.get('PORT', 8080))
 BASE_URL = os.environ.get('BASE_URL', f'http://localhost:{PORT}')
 
+print(f"🔌 Бот будет использовать порт: {PORT}")
+print(f"🌐 Для проверки: http://localhost:{PORT}/health")
+
 # Получаем строку подключения к PostgreSQL
 DATABASE_URL = os.environ.get('DATABASE_URL')
 if DATABASE_URL and DATABASE_URL.startswith('postgres://'):
@@ -229,15 +232,17 @@ ping_urls = []
 
 # Собираем все возможные URL для пинга
 if RENDER_EXTERNAL_URL:
-    ping_urls.append(RENDER_EXTERNAL_URL)
-    ping_urls.append(f"{RENDER_EXTERNAL_URL}/health")
-    ping_urls.append(f"{RENDER_EXTERNAL_URL}/status")
+    # Убираем протокол для создания разных вариаций
+    clean_url = RENDER_EXTERNAL_URL.replace('https://', '').replace('http://', '')
+    ping_urls.append(f"https://{clean_url}")
+    ping_urls.append(f"https://{clean_url}/health")
+    ping_urls.append(f"http://{clean_url}")  # Также пробуем HTTP
+    ping_urls.append(f"http://{clean_url}/health")
     logger.info(f"🌐 Внешний URL Render: {RENDER_EXTERNAL_URL}")
 
 # Добавляем локальные URL для надежности
 ping_urls.append(f"http://localhost:{PORT}")
 ping_urls.append(f"http://localhost:{PORT}/health")
-ping_urls.append(f"http://localhost:{PORT}/status")
 ping_urls.append(f"http://127.0.0.1:{PORT}")
 ping_urls.append(f"http://127.0.0.1:{PORT}/health")
 
@@ -249,45 +254,44 @@ def external_self_ping():
         logger.warning("⚠️ Нет внешнего URL для самопинга")
         return
     
-    logger.info(f"🚀 Запуск внешнего самопинга к {RENDER_EXTERNAL_URL}")
+    # Отключаем предупреждения urllib3 для этого потока
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    
+    logger.info(f"🚀 Запуск внешнего самопинга")
     
     while ping_active:
         try:
             current_time = time.time()
             
             # Пингуем через разные endpoints для надежности
-            endpoints = [
-                f"{RENDER_EXTERNAL_URL}/health",
-                f"{RENDER_EXTERNAL_URL}/",
-                f"{RENDER_EXTERNAL_URL}/status",
-                f"{RENDER_EXTERNAL_URL}/ping"
-            ]
-            
-            for endpoint in endpoints:
+            for endpoint in ping_urls:
                 try:
-                    # Используем requests с таймаутом
-                    response = requests.get(endpoint, timeout=10, verify=False)
+                    # Сначала пробуем с нормальной проверкой
+                    response = requests.get(endpoint, timeout=10)
                     if response.status_code == 200:
                         ping_count += 1
                         last_ping_time = current_time
-                        if ping_count % 12 == 0:  # Логируем каждый 12-й пинг (примерно раз в 10 минут)
+                        if ping_count % 12 == 0:  # Логируем каждый 12-й пинг
                             logger.info(f"🏓 Внешний пинг #{ping_count} к {endpoint} успешен")
-                    else:
-                        logger.debug(f"⚠️ Пинг к {endpoint} вернул {response.status_code}")
-                except requests.exceptions.ConnectionError:
-                    # Пробуем без verify=False если не работает
+                        break  # Если один успешен, выходим из цикла
+                except requests.exceptions.SSLError:
+                    # Если SSL ошибка, пробуем без проверки
                     try:
-                        response = requests.get(endpoint, timeout=10)
+                        logger.debug(f"⚠️ SSL ошибка для {endpoint}, пробуем без проверки")
+                        response = requests.get(endpoint, timeout=10, verify=False)
                         if response.status_code == 200:
                             ping_count += 1
                             last_ping_time = current_time
+                            if ping_count % 12 == 0:
+                                logger.info(f"🏓 Внешний пинг #{ping_count} к {endpoint} успешен (без SSL)")
+                            break
                     except:
                         pass
                 except Exception as e:
                     logger.debug(f"⚠️ Ошибка пинга {endpoint}: {e}")
             
-            # Спим 45 секунд (Render отключает через 15 минут = 900 секунд)
-            # 45 секунд гарантирует, что сервис всегда активен
+            # Спим 45 секунд
             for _ in range(45):
                 if not ping_active:
                     return
@@ -302,258 +306,113 @@ def start_external_ping():
     if RENDER_EXTERNAL_URL:
         ping_thread = threading.Thread(target=external_self_ping, daemon=True)
         ping_thread.start()
-        logger.info(f"✅ Внешний самопинг запущен для {RENDER_EXTERNAL_URL}")
+        logger.info(f"✅ Внешний самопинг запущен")
         return ping_thread
     return None
 
 # Запускаем внешний самопинг
 external_ping_thread = start_external_ping()
 
-# ================= ВЕБ-СЕРВЕР (УЛУЧШЕННЫЙ ДЛЯ UPTIMEROBOT) =================
+# ================= ПРОСТОЙ И НАДЕЖНЫЙ ВЕБ-СЕРВЕР =================
 
 async def handle(request):
-    """Главная страница для проверки работы"""
-    uptime = time.time() - start_time if 'start_time' in globals() else 0
+    """Главная страница"""
     return web.Response(
-        text=f"🤖 Telegram Numbers Shop Bot is running!\nUptime: {timedelta(seconds=int(uptime))}\nPings: {ping_count}",
+        text=f"🤖 Telegram Shop Bot is running!\nPort: {PORT}\nTime: {time.time()}",
         content_type='text/plain'
     )
 
 async def health_check(request):
-    """Подробная проверка здоровья бота (для UptimeRobot)"""
+    """Health check для Render и UptimeRobot"""
     global ping_count
-    ping_count += 1  # Считаем каждый запрос к health
-    last_ping_time = time.time()
+    ping_count += 1
     
-    health_data = {
+    # Простой JSON ответ
+    return web.json_response({
         'status': 'alive',
-        'timestamp': time.time(),
-        'uptime': time.time() - start_time if 'start_time' in globals() else 0,
         'port': PORT,
-        'admins_count': len(ADMIN_IDS),
-        'database': 'connected' if DATABASE_URL else 'sqlite',
-        'ping_count': ping_count,
-        'bot_status': 'active',
-        'render_url': RENDER_EXTERNAL_URL
-    }
-    
-    # Проверяем подключение к БД
+        'time': time.time(),
+        'ping': ping_count,
+        'uptime': time.time() - start_time if 'start_time' in globals() else 0
+    })
+
+async def payment_webhook(request):
+    """Webhook для получения уведомлений о платежах"""
     try:
-        db.get_stats()
-        health_data['db_status'] = 'ok'
+        data = await request.json()
+        logger.info(f"📩 Webhook получен: {data}")
+        
+        if data.get('payload'):
+            payment_id = data['payload']
+            if data.get('status') == 'paid':
+                if DATABASE_URL:
+                    with db.get_cursor() as cursor:
+                        cursor.execute('SELECT * FROM payments WHERE id = %s', (payment_id,))
+                        payment = cursor.fetchone()
+                        
+                        if payment and payment['status'] == 'pending':
+                            cursor.execute('''
+                                UPDATE payments SET status = 'completed', completed_at = %s WHERE id = %s
+                            ''', (time.time(), payment_id))
+                            
+                            cursor.execute('''
+                                UPDATE users SET stars_balance = stars_balance + %s WHERE user_id = %s
+                            ''', (payment['stars_amount'], payment['user_id']))
+                            
+                            cursor.execute('''
+                                UPDATE transactions SET status = 'completed', completed_at = %s 
+                                WHERE user_id = %s AND number_id = %s
+                            ''', (time.time(), payment['user_id'], payment['number_id']))
+                else:
+                    with db.get_cursor() as cursor:
+                        cursor.execute('SELECT * FROM payments WHERE id = ?', (payment_id,))
+                        payment = cursor.fetchone()
+                        
+                        if payment and payment['status'] == 'pending':
+                            cursor.execute('''
+                                UPDATE payments SET status = 'completed', completed_at = ? WHERE id = ?
+                            ''', (time.time(), payment_id))
+                            
+                            cursor.execute('''
+                                UPDATE users SET stars_balance = stars_balance + ? WHERE user_id = ?
+                            ''', (payment['stars_amount'], payment['user_id']))
+                            
+                            cursor.execute('''
+                                UPDATE transactions SET status = 'completed', completed_at = ? 
+                                WHERE user_id = ? AND number_id = ?
+                            ''', (time.time(), payment['user_id'], payment['number_id']))
+                
+                logger.info(f"✅ Webhook: платеж {payment_id} завершен")
+        
+        return web.Response(status=200)
     except Exception as e:
-        health_data['db_status'] = f'error: {str(e)}'
-        return web.json_response(health_data, status=500)
-    
-    return web.json_response(health_data, status=200)
-
-async def status_page(request):
-    """Красивая HTML страница статуса для визуального контроля"""
-    uptime = time.time() - start_time if 'start_time' in globals() else 0
-    stats = db.get_stats()
-    
-    # Получаем время последнего пинга
-    last_ping_str = datetime.fromtimestamp(last_ping_time).strftime('%H:%M:%S') if 'last_ping_time' in globals() else 'Неизвестно'
-    
-    html = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Telegram Shop Bot Status</title>
-        <meta http-equiv="refresh" content="30">
-        <meta charset="UTF-8">
-        <style>
-            body {{ 
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif; 
-                margin: 0; 
-                padding: 20px; 
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-            }}
-            .container {{ 
-                max-width: 900px; 
-                margin: 0 auto; 
-                background: white; 
-                padding: 30px; 
-                border-radius: 20px; 
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            }}
-            h1 {{ 
-                color: #333; 
-                margin-top: 0;
-                font-size: 32px;
-                border-bottom: 2px solid #f0f0f0;
-                padding-bottom: 15px;
-            }}
-            .status {{ 
-                padding: 20px; 
-                border-radius: 12px; 
-                margin: 20px 0;
-            }}
-            .online {{ 
-                background: #d4edda; 
-                color: #155724;
-                border-left: 5px solid #28a745;
-            }}
-            .stats-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 20px;
-                margin: 20px 0;
-            }}
-            .stat-card {{
-                background: #f8f9fa;
-                padding: 20px;
-                border-radius: 12px;
-                text-align: center;
-                transition: transform 0.2s;
-            }}
-            .stat-card:hover {{
-                transform: translateY(-5px);
-                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-            }}
-            .stat-value {{
-                font-size: 36px;
-                font-weight: bold;
-                color: #667eea;
-                margin: 10px 0;
-            }}
-            .stat-label {{
-                color: #666;
-                font-size: 14px;
-                text-transform: uppercase;
-                letter-spacing: 1px;
-            }}
-            .ping-info {{
-                background: #e3f2fd;
-                padding: 15px;
-                border-radius: 10px;
-                margin: 20px 0;
-                text-align: center;
-            }}
-            .ping-number {{
-                font-size: 48px;
-                font-weight: bold;
-                color: #1976d2;
-            }}
-            table {{ 
-                width: 100%; 
-                border-collapse: collapse; 
-                margin: 20px 0;
-                background: white;
-                border-radius: 10px;
-                overflow: hidden;
-            }}
-            td {{ 
-                padding: 12px; 
-                border-bottom: 1px solid #e0e0e0;
-            }}
-            td:first-child {{
-                font-weight: bold;
-                background: #f5f5f5;
-                width: 200px;
-            }}
-            .footer {{
-                text-align: center;
-                margin-top: 30px;
-                color: #666;
-                font-size: 12px;
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>🤖 Telegram Numbers Shop Bot</h1>
-            
-            <div class="status online">
-                <h2>✅ Бот работает</h2>
-                <p>⏱ Время работы: {timedelta(seconds=int(uptime))}</p>
-                <p>🕐 Последний пинг: {last_ping_str}</p>
-                <p>🌐 Внешний URL: {RENDER_EXTERNAL_URL or 'Не настроен'}</p>
-            </div>
-            
-            <div class="ping-info">
-                <div class="stat-label">Всего пингов</div>
-                <div class="ping-number">{ping_count}</div>
-                <div>🏓 UptimeRobot мониторинг активен</div>
-            </div>
-            
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-label">Пользователи</div>
-                    <div class="stat-value">{stats['total_users']}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Номера в продаже</div>
-                    <div class="stat-value">{stats['available_numbers']}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Продано номеров</div>
-                    <div class="stat-value">{stats['sold_numbers']}</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-label">Аккаунты TG</div>
-                    <div class="stat-value">{stats['active_accounts']}</div>
-                </div>
-            </div>
-            
-            <h3>📊 Детальная статистика:</h3>
-            <table>
-                <tr><td>👥 Пользователей:</td><td>{stats['total_users']}</td></tr>
-                <tr><td>📱 Номеров в продаже:</td><td>{stats['available_numbers']}</td></tr>
-                <tr><td>✅ Продано номеров:</td><td>{stats['sold_numbers']}</td></tr>
-                <tr><td>⏳ В обработке:</td><td>{stats['pending_numbers']}</td></tr>
-                <tr><td>🤖 Активных аккаунтов:</td><td>{stats['active_accounts']}/{stats['total_accounts']}</td></tr>
-                <tr><td>📢 Каналов подписки:</td><td>{stats['total_channels']}/{MAX_CHANNELS}</td></tr>
-                <tr><td>💰 Продано звёзд:</td><td>{stats['total_stars_sold']} ⭐️</td></tr>
-                <tr><td>💵 Выручка:</td><td>{stats['total_revenue_rub']:.2f}₽</td></tr>
-                <tr><td>🏓 Всего пингов:</td><td>{ping_count}</td></tr>
-                <tr><td>🌐 Render URL:</td><td>{RENDER_EXTERNAL_URL or 'Не настроен'}</td></tr>
-            </table>
-            
-            <div class="footer">
-                <p>🔄 Страница обновляется каждые 30 секунд</p>
-                <p>📡 UptimeRobot мониторинг: /health и /status</p>
-                <p>⚡ Система вечной работы активна</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    return web.Response(text=html, content_type='text/html')
-
-async def ping_endpoint(request):
-    """Простой ping endpoint для быстрой проверки"""
-    return web.Response(text="pong", content_type='text/plain')
+        logger.error(f"❌ Webhook error: {e}")
+        return web.Response(status=500)
 
 async def web_server():
-    """Запуск веб-сервера с улучшенными эндпоинтами"""
+    """Максимально простой веб-сервер"""
     app = web.Application()
     
-    # Основные эндпоинты
+    # Только самые нужные эндпоинты
     app.router.add_get('/', handle)
     app.router.add_get('/health', health_check)
-    app.router.add_get('/status', status_page)
-    app.router.add_get('/ping', ping_endpoint)
-    
-    # Webhook для платежей
     app.router.add_post('/api/cryptobot/webhook', payment_webhook)
     
     runner = web.AppRunner(app)
     await runner.setup()
+    
+    # Явно указываем хост 0.0.0.0 и порт из переменной окружения
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
     
-    logger.info(f"✅ Веб-сервер запущен на порту {PORT}")
-    logger.info(f"📡 Доступные эндпоинты:")
-    logger.info(f"   • / - главная страница")
-    logger.info(f"   • /health - JSON статус для UptimeRobot")
-    logger.info(f"   • /status - красивая HTML страница")
-    logger.info(f"   • /ping - простой ping/pong")
+    # Выводим в логи критически важную информацию
+    print(f"✅ ВЕБ-СЕРВЕР ЗАПУЩЕН НА ПОРТУ {PORT}")
+    print(f"📡 Проверка: http://localhost:{PORT}/health")
+    logger.info(f"✅ Веб-сервер слушает порт {PORT} на всех интерфейсах")
     
     if RENDER_EXTERNAL_URL:
-        logger.info(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
-        logger.info(f"🔗 Для UptimeRobot используйте: {RENDER_EXTERNAL_URL}/health")
+        print(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
+        print(f"📡 Для UptimeRobot: {RENDER_EXTERNAL_URL}/health")
     
     # Бесконечное ожидание
     while True:
@@ -5102,7 +4961,7 @@ async def on_startup(dp):
     
     if RENDER_EXTERNAL_URL:
         logger.info(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
-        logger.info(f"📡 Для UptimeRobot используйте: {RENDER_EXTERNAL_URL}/health и {RENDER_EXTERNAL_URL}/status")
+        logger.info(f"📡 Для UptimeRobot используйте: {RENDER_EXTERNAL_URL}/health")
         logger.info(f"✅ Внешний самопинг активен (каждые 45 секунд)")
     
     for admin_id in ADMIN_IDS:
@@ -5128,9 +4987,7 @@ async def on_startup(dp):
                 f"• Python: {sys.version.split()[0]}\n"
                 f"• API ID: {API_ID}\n\n"
                 f"🌐 <b>Внешний URL:</b> {RENDER_EXTERNAL_URL or 'Не настроен'}\n"
-                f"📡 <b>Для UptimeRobot добавьте:</b>\n"
-                f"   • {RENDER_EXTERNAL_URL}/health\n"
-                f"   • {RENDER_EXTERNAL_URL}/status"
+                f"📡 <b>Для UptimeRobot добавьте:</b> {RENDER_EXTERNAL_URL}/health"
             )
         except Exception as e:
             logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
@@ -5239,9 +5096,7 @@ if __name__ == "__main__":
     print(f"🌐 Порт: {PORT}")
     if RENDER_EXTERNAL_URL:
         print(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
-        print(f"📡 UptimeRobot endpoints:")
-        print(f"   • {RENDER_EXTERNAL_URL}/health")
-        print(f"   • {RENDER_EXTERNAL_URL}/status")
+        print(f"📡 UptimeRobot endpoint: {RENDER_EXTERNAL_URL}/health")
     print("=" * 80)
     print("⚡ СИСТЕМА 'ВЕЧНОЙ РАБОТЫ':")
     print("   • Внутренний пинг каждые 30 сек")
