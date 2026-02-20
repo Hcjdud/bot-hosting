@@ -1,6 +1,6 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 30.0 (FINAL - ИСПРАВЛЕННАЯ ВЕРСИЯ)
+Версия: 31.0 (FINAL - МЕДИА ОТКЛЮЧЕНО ДО ЗАГРУЗКИ)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
@@ -8,15 +8,15 @@ Telegram Numbers Shop Bot + Session Manager
 - Поддержка двухфакторной аутентификации (2FA)
 - 3 СПОСОБА ПОПОЛНЕНИЯ БАЛАНСА
 - Админ-панель с выдачей звёзд
+- ✅ МЕДИА ОТКЛЮЧЕНО ДО ЗАГРУЗКИ АДМИНОМ
+- ✅ ЗАГРУЗКА ФОТО И ГИФОК ЧЕРЕЗ АДМИНКУ
 - ✅ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА
-- ✅ ПРОВЕРКА УНИКАЛЬНОСТИ ПРОЦЕССА
 - ✅ ТОКЕН ТОЛЬКО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ АДМИНЫ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ КОШЕЛЬКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ
 - ✅ API ДАННЫЕ В КОДЕ (НЕ СЕКРЕТНЫЕ)
-- ✅ НАСТРАИВАЕМОЕ МЕНЮ (текст, описание, фото/гифка)
+- ✅ НАСТРАИВАЕМОЕ МЕНЮ (текст, описание)
 - ✅ ИЗМЕНЕНИЕ ПРОФИЛЯ В АДМИНКЕ
-- ✅ ЗАГРУЗКА ФОТО И ГИФОК
 - ✅ ОБЯЗАТЕЛЬНЫЕ ПОДПИСКИ НА КАНАЛЫ (до 5 каналов)
 - ✅ ПРОВЕРКА ПОДПИСКИ ПРИ ПОКУПКЕ
 - ✅ УПРАВЛЕНИЕ КАНАЛАМИ В АДМИНКЕ
@@ -26,7 +26,7 @@ Telegram Numbers Shop Bot + Session Manager
 - ✅ ПАРАЛЛЕЛЬНАЯ РАБОТА ВЕБ-СЕРВЕРА И БОТА
 - ✅ СИСТЕМА "ВЕЧНОЙ РАБОТЫ" (НЕ ВЫКЛЮЧАЕТСЯ)
 - ✅ АВТОМАТИЧЕСКИЙ ПЕРЕЗАПУСК ПРИ СБОЯХ
-- ✅ ПИНГ-СИСТЕМА ДЛЯ RENDER
+- ✅ ПИНГ-СИСТЕМА ДЛЯ RENDER (каждые 30 секунд)
 - Полный мониторинг и логирование
 - Поддержка PostgreSQL на Render
 """
@@ -96,6 +96,9 @@ from pyrogram.errors import (
 
 # Для веб-сервера
 from aiohttp import web
+
+# Загружаем переменные окружения
+load_dotenv()
 
 # ================= ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
 # Это предотвращает запуск нескольких экземпляров бота
@@ -365,6 +368,7 @@ def keep_alive_ping():
 # Запускаем фоновый поток пинга
 ping_thread = threading.Thread(target=keep_alive_ping, daemon=True)
 ping_thread.start()
+logger.info("✅ Пинг-система запущена (каждые 30 секунд)")
 
 def should_restart():
     """Проверка, можно ли перезапустить бота"""
@@ -2655,35 +2659,13 @@ async def cmd_start(message: Message):
     
     # Получаем настройки меню
     welcome_text = db.get_welcome_text()
-    welcome_media = db.get_welcome_media()
     
-    if welcome_media:
-        # Проверяем тип медиа (фото или гифка)
-        try:
-            await bot.send_animation(
-                chat_id=user_id,
-                animation=welcome_media,
-                caption=welcome_text,
-                reply_markup=get_main_keyboard(user_id)
-            )
-        except Exception:
-            try:
-                await bot.send_photo(
-                    chat_id=user_id,
-                    photo=welcome_media,
-                    caption=welcome_text,
-                    reply_markup=get_main_keyboard(user_id)
-                )
-            except Exception:
-                await message.reply(
-                    welcome_text,
-                    reply_markup=get_main_keyboard(user_id)
-                )
-    else:
-        await message.reply(
-            welcome_text,
-            reply_markup=get_main_keyboard(user_id)
-        )
+    # ⚠️ МЕДИА ВРЕМЕННО ОТКЛЮЧЕНО для стабильности
+    # Медиа можно будет загрузить через админку позже
+    await message.reply(
+        welcome_text,
+        reply_markup=get_main_keyboard(user_id)
+    )
 
 @dp.callback_query_handler(lambda c: c.data == 'check_subscription')
 async def check_subscription_callback(callback: CallbackQuery):
@@ -2694,35 +2676,11 @@ async def check_subscription_callback(callback: CallbackQuery):
     
     if is_subscribed or is_admin(user_id):
         welcome_text = db.get_welcome_text()
-        welcome_media = db.get_welcome_media()
         
-        if welcome_media:
-            try:
-                await callback.message.delete()
-                await bot.send_animation(
-                    chat_id=user_id,
-                    animation=welcome_media,
-                    caption="✅ <b>Спасибо за подписку!</b>\n\n" + welcome_text,
-                    reply_markup=get_main_keyboard(user_id)
-                )
-            except Exception:
-                try:
-                    await bot.send_photo(
-                        chat_id=user_id,
-                        photo=welcome_media,
-                        caption="✅ <b>Спасибо за подписку!</b>\n\n" + welcome_text,
-                        reply_markup=get_main_keyboard(user_id)
-                    )
-                except Exception:
-                    await callback.message.edit_text(
-                        "✅ <b>Спасибо за подписку!</b>\n\n" + welcome_text,
-                        reply_markup=get_main_keyboard(user_id)
-                    )
-        else:
-            await callback.message.edit_text(
-                "✅ <b>Спасибо за подписку!</b>\n\n" + welcome_text,
-                reply_markup=get_main_keyboard(user_id)
-            )
+        await callback.message.edit_text(
+            "✅ <b>Спасибо за подписку!</b>\n\n" + welcome_text,
+            reply_markup=get_main_keyboard(user_id)
+        )
     else:
         await callback.message.edit_text(
             "📢 <b>Вы не подписались на все каналы:</b>\n\n"
@@ -2755,35 +2713,11 @@ async def main_menu(callback: CallbackQuery):
         return
     
     welcome_text = db.get_welcome_text()
-    welcome_media = db.get_welcome_media()
     
-    if welcome_media:
-        try:
-            await callback.message.delete()
-            await bot.send_animation(
-                chat_id=user_id,
-                animation=welcome_media,
-                caption=welcome_text,
-                reply_markup=get_main_keyboard(user_id)
-            )
-        except Exception:
-            try:
-                await bot.send_photo(
-                    chat_id=user_id,
-                    photo=welcome_media,
-                    caption=welcome_text,
-                    reply_markup=get_main_keyboard(user_id)
-                )
-            except Exception:
-                await callback.message.edit_text(
-                    welcome_text,
-                    reply_markup=get_main_keyboard(user_id)
-                )
-    else:
-        await callback.message.edit_text(
-            welcome_text,
-            reply_markup=get_main_keyboard(user_id)
-        )
+    await callback.message.edit_text(
+        welcome_text,
+        reply_markup=get_main_keyboard(user_id)
+    )
 
 @dp.callback_query_handler(lambda c: c.data == 'profile')
 async def show_profile(callback: CallbackQuery):
@@ -2860,7 +2794,7 @@ async def admin_edit_menu(callback: CallbackQuery):
 👤 <b>Текст профиля:</b>
 {profile_text[:100]}...{'' if len(profile_text) <= 100 else ''}
 
-🖼 <b>Медиа:</b> {media_status}
+🖼 <b>Медиа:</b> {media_status} (отключено до загрузки)
 
 Выберите действие:
 """
@@ -4909,7 +4843,8 @@ async def on_startup(dp):
     logger.info(f"📊 Начальная статистика: Users={stats['total_users']}, "
                 f"Numbers={stats['available_numbers']}, Accounts={stats['total_accounts']}, "
                 f"Channels={stats['total_channels']}")
-    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'}")
+    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'} (отключено до загрузки)")
+    logger.info(f"🏓 Пинг-система активна (каждые 30 секунд)")
     
     for admin_id in ADMIN_IDS:
         try:
@@ -4924,9 +4859,10 @@ async def on_startup(dp):
                 f"• Каналов подписки: {stats['total_channels']}/{MAX_CHANNELS}\n\n"
                 f"⚙️ <b>Система:</b>\n"
                 f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
-                f"• Медиа в меню: {'✅' if welcome_media else '❌'}\n"
+                f"• Медиа в меню: {'✅' if welcome_media else '❌'} (ждет загрузки)\n"
                 f"• Сессии сохраняются: ✅\n"
                 f"• Автоперезапуск: ✅\n"
+                f"• Пинг-система: ✅ (каждые 30 сек)\n"
                 f"• Health monitor: ✅\n"
                 f"• Вечный пинг: ✅\n"
                 f"• Python: {sys.version.split()[0]}\n"
@@ -4974,7 +4910,8 @@ async def on_shutdown(dp):
                 admin_id,
                 f"🛑 <b>Бот остановлен</b>\n\n"
                 f"⏱ Время работы: {uptime_str}\n"
-                f"✅ Все сессии закрыты, файлы сохранены"
+                f"✅ Все сессии закрыты, файлы сохранены\n"
+                f"🏓 Всего пингов: {ping_count}"
             )
         except Exception as e:
             logger.error(f"❌ Не удалось отправить уведомление: {e}")
@@ -5017,12 +4954,12 @@ def start_bot():
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("🚀 Telegram Numbers Shop Bot v30.0 - ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
+    print("🚀 Telegram Numbers Shop Bot v31.0 - МЕДИА ОТКЛЮЧЕНО ДО ЗАГРУЗКИ")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
     print("✅ Админы с бесконечным балансом ♾")
     print("✅ Обязательные подписки на каналы (до 5)")
     print("✅ Редактирование текста приветствия и профиля")
-    print("✅ Загрузка фото и GIF в главное меню")
+    print("✅ Загрузка фото и GIF в главное меню (ЧЕРЕЗ АДМИНКУ)")
     print("✅ Удаление сессий и номеров")
     print("✅ Сессии СОХРАНЯЮТСЯ в файлы")
     print("✅ Параллельная работа веб-сервера")
