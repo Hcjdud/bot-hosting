@@ -1,6 +1,6 @@
 """
 Telegram Numbers Shop Bot + Session Manager
-Версия: 31.3 (FINAL - УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА)
+Версия: 31.4 (FINAL - ФОРСИРОВАННАЯ ДИАГНОСТИКА)
 Функции:
 - Продажа виртуальных номеров Telegram
 - Создание и управление сессиями Telegram аккаунтов
@@ -31,6 +31,7 @@ Telegram Numbers Shop Bot + Session Manager
 - ✅ МОНИТОРИНГ ПАМЯТИ
 - ✅ ДЕТАЛЬНЫЙ CRASH-ЛОГ
 - ✅ ПЛАНОВЫЙ ПЕРЕЗАПУСК ОТКЛЮЧЕН
+- ✅ ФОРСИРОВАННАЯ ДИАГНОСТИКА ЗАПУСКА
 - Полный мониторинг и логирование
 - Поддержка PostgreSQL на Render
 """
@@ -105,21 +106,62 @@ from aiohttp import web
 # Загружаем переменные окружения
 load_dotenv()
 
-# ================= ДИАГНОСТИКА =================
-print("🔍 Запуск диагностики...")
-print(f"📌 Текущая директория: {os.getcwd()}")
-print(f"📌 Python версия: {sys.version}")
-print(f"📌 Переменные окружения:")
-print(f"   • PORT: {os.environ.get('PORT', 'не задан')}")
-print(f"   • RENDER_EXTERNAL_URL: {os.environ.get('RENDER_EXTERNAL_URL', 'не задан')}")
-print(f"   • BOT_TOKEN: {'✅ задан' if os.environ.get('BOT_TOKEN') else '❌ не задан'}")
-print(f"   • ADMIN_IDS: {os.environ.get('ADMIN_IDS', 'не заданы')}")
-print("=" * 50)
+# ================= ФОРСИРОВАННАЯ ДИАГНОСТИКА ЗАПУСКА =================
+print("\n" + "="*80)
+print("🔴 КРИТИЧЕСКАЯ ДИАГНОСТИКА ЗАПУСКА")
+print(f"1. Текущее время: {time.time()}")
+print(f"2. Python версия: {sys.version}")
+print(f"3. Текущая директория: {os.getcwd()}")
+print(f"4. PID процесса: {os.getpid()}")
+print(f"5. Аргументы командной строки: {sys.argv}")
+print("="*50)
+sys.stdout.flush()  # Принудительный сброс буфера
 
-# ================= УСИЛЕННАЯ ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
+# Проверяем доступность файловой системы
+try:
+    with open('/tmp/test_write.txt', 'w') as f:
+        f.write(f"test_{time.time()}")
+    print("✅ /tmp доступен для записи")
+    os.remove('/tmp/test_write.txt')
+except Exception as e:
+    print(f"❌ Ошибка записи в /tmp: {e}")
+
+sys.stdout.flush()
+print("="*50)
+print("🔴 ДИАГНОСТИКА ЗАВЕРШЕНА, ПЕРЕХОД К ОСНОВНОМУ КОДУ")
+print("="*80 + "\n")
+sys.stdout.flush()
+
+# ================= ПРОВЕРКА ПОРТА =================
+
+def check_port_availability():
+    """Проверка доступности порта"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(('127.0.0.1', PORT))
+    if result == 0:
+        print(f"❌ Порт {PORT} уже занят!")
+        # Пытаемся найти процесс, который занимает порт
+        try:
+            import psutil
+            for conn in psutil.net_connections():
+                if conn.laddr.port == PORT:
+                    print(f"   Процесс: PID={conn.pid}, имя={psutil.Process(conn.pid).name()}")
+                    break
+        except:
+            pass
+        return False
+    else:
+        print(f"✅ Порт {PORT} свободен")
+        return True
+    sock.close()
+
+# ================= ПРОВЕРКА НА УНИКАЛЬНОСТЬ ЗАПУСКА =================
 
 def check_single_instance():
     """Многоуровневая проверка уникальности запуска"""
+    
+    print("\n🔴 ПРОВЕРКА УНИКАЛЬНОСТИ ЗАПУСКА")
+    sys.stdout.flush()
     
     # Уровень 1: Файловая блокировка
     lock_file = '/tmp/bot.lock'
@@ -152,22 +194,11 @@ def check_single_instance():
         f.write(str(os.getpid()))
     print(f"✅ Уровень 2: PID {os.getpid()} сохранен")
     
-    # Уровень 3: Проверка порта (только для Render)
-    if IS_RENDER:
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            result = sock.connect_ex(('127.0.0.1', PORT))
-            if result == 0:
-                # Порт занят, проверяем, не нашим ли процессом
-                for conn in psutil.net_connections():
-                    if conn.laddr.port == PORT and conn.pid != os.getpid():
-                        if psutil.pid_exists(conn.pid):
-                            print(f"❌ Уровень 3: Порт {PORT} занят процессом {conn.pid}")
-                            return False, "port_in_use"
-            sock.close()
-        except Exception as e:
-            print(f"⚠️ Уровень 3: Ошибка проверки порта: {e}")
+    # Уровень 3: Проверка порта
+    if not check_port_availability():
+        print("⚠️ Уровень 3: Порт занят, но пробуем продолжить")
     
+    sys.stdout.flush()
     return True, "ok"
 
 # Выполняем проверку
@@ -177,7 +208,8 @@ if not is_unique:
     print("💡 Убедитесь, что на Render запущен только один экземпляр")
     sys.exit(0)
 
-print("✅ Все проверки уникальности пройдены")
+print("✅ Все проверки уникальности пройдены\n")
+sys.stdout.flush()
 
 # ================= НАСТРОЙКА ЛОГИРОВАНИЯ =================
 logging.basicConfig(
@@ -186,7 +218,7 @@ logging.basicConfig(
     handlers=[
         logging.StreamHandler(sys.stdout),
         logging.FileHandler('bot.log'),
-        logging.FileHandler('crash.log')  # Добавляем отдельный файл для критических ошибок
+        logging.FileHandler('crash.log')
     ]
 )
 logger = logging.getLogger(__name__)
@@ -202,6 +234,7 @@ BASE_URL = os.environ.get('BASE_URL', f'http://localhost:{PORT}')
 
 print(f"🔌 Бот будет использовать порт: {PORT}")
 print(f"🌐 Для проверки: http://localhost:{PORT}/health")
+sys.stdout.flush()
 
 # Получаем строку подключения к PostgreSQL
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -483,10 +516,12 @@ async def web_server():
     print(f"✅ ВЕБ-СЕРВЕР ЗАПУЩЕН НА ПОРТУ {PORT}")
     print(f"📡 Проверка: http://localhost:{PORT}/health")
     logger.info(f"✅ Веб-сервер слушает порт {PORT} на всех интерфейсах")
+    sys.stdout.flush()
     
     if RENDER_EXTERNAL_URL:
         print(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
         print(f"📡 Для UptimeRobot: {RENDER_EXTERNAL_URL}/health")
+        sys.stdout.flush()
     
     # ВАЖНО: Не делаем бесконечный цикл!
     # Просто возвращаемся, веб-сервер продолжает работу в фоне
@@ -564,7 +599,7 @@ def should_restart():
     restart_times = [t for t in restart_times if current_time - t < restart_window]
     
     if len(restart_times) >= max_restarts:
-        logger.critical(f"❌ Слишком много перезапусков ({len(restart_times)} за {restart_window/3600}ч)")
+        logger.critical(f"❌ Слишком много перезапусков ({len(restart_times)} за {restart_window/3600}ч")
         return False
     
     restart_times.append(current_time)
@@ -5005,95 +5040,106 @@ async def memory_monitor():
 
 async def on_startup(dp):
     """Действия при запуске бота"""
+    print("\n" + "="*50)
+    print("🔴 ВХОЖУ В on_startup()")
+    print(f"Время: {time.time()}")
+    sys.stdout.flush()
+    
     global start_time, web_runner
     start_time = time.time()
     
     # Проверяем, не запущен ли уже бот (дополнительная защита)
     if hasattr(on_startup, "called") and on_startup.called:
+        print("⚠️ on_startup уже был вызван, пропускаем...")
+        sys.stdout.flush()
         logger.warning("⚠️ on_startup уже был вызван, пропускаем...")
         return
     on_startup.called = True
     
-    logger.info("🚀 Бот запускается...")
+    print("🔴 1. Проверка авторизации бота...")
+    sys.stdout.flush()
     
     try:
         me = await bot.get_me()
+        print(f"✅ Бот авторизован: @{me.username} (ID: {me.id})")
+        sys.stdout.flush()
         logger.info(f"✅ Бот авторизован: @{me.username} (ID: {me.id})")
     except Unauthorized:
+        print("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН!")
+        sys.stdout.flush()
         logger.error("❌ НЕДЕЙСТВИТЕЛЬНЫЙ ТОКЕН! Получите новый у @BotFather")
         return
+    except Exception as e:
+        print(f"❌ Ошибка при авторизации: {e}")
+        sys.stdout.flush()
+        logger.error(f"❌ Ошибка при авторизации: {e}")
+        return
     
-    logger.info(f"📁 Папка сессий: {SESSIONS_DIR}")
-    logger.info(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
-    logger.info(f"📁 Папка медиа: {MEDIA_DIR}")
-    if db.db_url:
-        logger.info(f"📁 База данных: PostgreSQL")
-    else:
-        logger.info(f"📁 База данных: SQLite")
+    print("🔴 2. Запуск веб-сервера...")
+    sys.stdout.flush()
     
-    # Запускаем веб-сервер (не ждем его завершения)
+    # Запускаем веб-сервер
     try:
         asyncio.create_task(web_server())
+        print("✅ Веб-сервер запущен в фоновом режиме")
+        sys.stdout.flush()
         logger.info("✅ Веб-сервер запущен в фоновом режиме")
     except Exception as e:
+        print(f"❌ Ошибка запуска веб-сервера: {e}")
+        sys.stdout.flush()
         logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
     
+    print("🔴 3. Загрузка сессий...")
+    sys.stdout.flush()
+    
     # Загружаем сохраненные сессии
-    await session_manager.load_saved_sessions()
+    try:
+        await session_manager.load_saved_sessions()
+        print("✅ Сессии загружены")
+        sys.stdout.flush()
+    except Exception as e:
+        print(f"❌ Ошибка загрузки сессий: {e}")
+        sys.stdout.flush()
+    
+    print("🔴 4. Запуск фоновых задач...")
+    sys.stdout.flush()
     
     # Запускаем фоновые задачи
     asyncio.create_task(cleanup_task())
     asyncio.create_task(stats_logger())
     asyncio.create_task(health_monitor())
-    asyncio.create_task(memory_monitor())  # Добавляем монитор памяти
+    asyncio.create_task(memory_monitor())
     # Плановый перезапуск ОТКЛЮЧЕН
+    
+    print("✅ Фоновые задачи запущены")
+    sys.stdout.flush()
     
     stats = db.get_stats()
     welcome_media = db.get_welcome_media()
     
-    logger.info(f"📊 Начальная статистика: Users={stats['total_users']}, "
-                f"Numbers={stats['available_numbers']}, Accounts={stats['total_accounts']}, "
-                f"Channels={stats['total_channels']}")
-    logger.info(f"🖼 Медиа в приветствии: {'✅' if welcome_media else '❌'} (отключено до загрузки)")
-    logger.info(f"🏓 Внутренняя пинг-система активна (каждые 30 секунд)")
+    print(f"📊 Статистика: Users={stats['total_users']}, Numbers={stats['available_numbers']}")
+    sys.stdout.flush()
     
-    if RENDER_EXTERNAL_URL:
-        logger.info(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
-        logger.info(f"📡 Для UptimeRobot используйте: {RENDER_EXTERNAL_URL}/health")
-        logger.info(f"✅ Внешний самопинг активен (каждые 45 секунд)")
+    print("🔴 5. Отправка уведомлений админам...")
+    sys.stdout.flush()
     
     for admin_id in ADMIN_IDS:
         try:
             await bot.send_message(
                 admin_id,
                 f"🚀 <b>Numbers Shop Bot запущен!</b>\n\n"
-                f"📊 <b>Статистика:</b>\n"
-                f"• Пользователей: {stats['total_users']}\n"
-                f"• Номеров в продаже: {stats['available_numbers']}\n"
-                f"• Аккаунтов TG: {stats['active_accounts']}\n"
-                f"• Продано номеров: {stats['sold_numbers']}\n"
-                f"• Каналов подписки: {stats['total_channels']}/{MAX_CHANNELS}\n\n"
-                f"⚙️ <b>Система:</b>\n"
-                f"• База данных: {'PostgreSQL' if db.db_url else 'SQLite'}\n"
-                f"• Медиа в меню: {'✅' if welcome_media else '❌'} (ждет загрузки)\n"
-                f"• Сессии сохраняются: ✅\n"
-                f"• Автоперезапуск: ✅\n"
-                f"• Внутренний пинг: ✅ (каждые 30 сек)\n"
-                f"• Внешний самопинг: ✅ (каждые 45 сек)\n"
-                f"• UptimeRobot: ✅ (каждые 5 минут)\n"
-                f"• Health monitor: ✅\n"
-                f"• Memory monitor: ✅\n"
-                f"• Плановый перезапуск: ❌ (отключен)\n"
-                f"• Веб-сервер: ✅ (не блокирует бота)\n"
-                f"• Защита от двойного запуска: ✅ (усиленная)\n"
-                f"• Python: {sys.version.split()[0]}\n"
-                f"• API ID: {API_ID}\n\n"
-                f"🌐 <b>Внешний URL:</b> {RENDER_EXTERNAL_URL or 'Не настроен'}\n"
-                f"📡 <b>Для UptimeRobot добавьте:</b> {RENDER_EXTERNAL_URL}/health"
+                f"📊 Пользователей: {stats['total_users']}\n"
+                f"📱 Номеров: {stats['available_numbers']}"
             )
+            print(f"✅ Уведомление отправлено админу {admin_id}")
+            sys.stdout.flush()
         except Exception as e:
-            logger.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+            print(f"❌ Не удалось уведомить админа {admin_id}: {e}")
+            sys.stdout.flush()
     
+    print("🔴 ВЫХОЖУ ИЗ on_startup()")
+    print("="*50 + "\n")
+    sys.stdout.flush()
     logger.info("✅ Бот готов к работе!")
 
 # Устанавливаем флаг для проверки повторного вызова
@@ -5107,6 +5153,8 @@ async def on_shutdown(dp):
     running = False
     ping_active = False
     
+    print(f"\n🛑 Бот останавливается. Причина: {shutdown_reason}")
+    sys.stdout.flush()
     logger.info(f"🛑 Бот останавливается. Причина: {shutdown_reason}")
     
     # Записываем причину остановки в crash.log
@@ -5121,8 +5169,12 @@ async def on_shutdown(dp):
     if web_runner:
         try:
             await web_runner.cleanup()
+            print("✅ Веб-сервер остановлен")
+            sys.stdout.flush()
             logger.info("✅ Веб-сервер остановлен")
         except Exception as e:
+            print(f"❌ Ошибка при остановке веб-сервера: {e}")
+            sys.stdout.flush()
             logger.error(f"❌ Ошибка при остановке веб-сервера: {e}")
     
     closed_sessions = 0
@@ -5133,12 +5185,16 @@ async def on_shutdown(dp):
         except Exception as e:
             logger.error(f"❌ Ошибка при закрытии сессии {phone}: {e}")
     
+    print(f"✅ Закрыто активных сессий: {closed_sessions}")
+    sys.stdout.flush()
     logger.info(f"✅ Закрыто активных сессий: {closed_sessions}")
     
     try:
         if not db.db_url:
             backup_file = os.path.join(DATABASE_BACKUP_DIR, f"final_backup_{int(time.time())}.db")
             shutil.copy2(db.db_path, backup_file)
+            print(f"✅ Создан финальный бекап: {backup_file}")
+            sys.stdout.flush()
             logger.info(f"✅ Создан финальный бекап: {backup_file}")
     except Exception as e:
         logger.error(f"❌ Ошибка создания финального бекапа: {e}")
@@ -5167,6 +5223,8 @@ async def on_shutdown(dp):
         except Exception as e:
             logger.error(f"❌ Не удалось отправить уведомление: {e}")
     
+    print(f"✅ Бот остановлен. Время работы: {uptime_str}, причина: {shutdown_reason}")
+    sys.stdout.flush()
     logger.info(f"✅ Бот остановлен. Время работы: {uptime_str}, причина: {shutdown_reason}")
 
 # ================= ФОНОВЫЕ ЗАДАЧИ =================
@@ -5282,45 +5340,81 @@ async def health_monitor():
             error_count += 1
             await asyncio.sleep(30)
 
-# ================= ЗАПУСК БОТА =================
+# ================= ИСПРАВЛЕННАЯ ФУНКЦИЯ START_BOT =================
 
 def start_bot():
-    """Запуск бота с защитой от падений"""
+    """Запуск бота с защитой от падений и принудительным выводом"""
+    print("\n" + "="*50)
+    print("🔴 ВХОЖУ В ФУНКЦИЮ start_bot()")
+    print(f"Текущее время: {time.time()}")
+    sys.stdout.flush()
+    
     max_retries = 1000
     retry_count = 0
     
     while retry_count < max_retries:
+        print(f"\n🔴 ПОПЫТКА ЗАПУСКА #{retry_count + 1}")
+        print(f"Время: {time.time()}")
+        sys.stdout.flush()
+        
         try:
-            logger.info(f"🚀 Попытка запуска #{retry_count + 1}")
+            print("🔴 Вызываю executor.start_polling()...")
+            sys.stdout.flush()
             
             executor.start_polling(
                 dp,
                 skip_updates=True,
                 on_startup=on_startup,
-                on_shutdown=on_shutdown
+                on_shutdown=on_shutdown,
+                timeout=30,  # Добавляем таймаут
+                relax=0.1    # Добавляем релакс
             )
             
+            print("✅ executor.start_polling() завершился нормально")
+            sys.stdout.flush()
             logger.info("✅ Бот нормально завершил работу")
             break
             
-        except (Unauthorized, Exception) as e:
+        except KeyboardInterrupt:
+            print("🔴 Получен KeyboardInterrupt")
+            sys.stdout.flush()
+            break
+            
+        except Exception as e:
             retry_count += 1
-            logger.error(f"❌ Критическая ошибка при запуске: {e}")
+            error_msg = f"❌ Критическая ошибка при запуске #{retry_count}: {e}"
+            print(error_msg)
+            print(traceback.format_exc())
+            print(f"Тип ошибки: {type(e).__name__}")
+            sys.stdout.flush()
+            
+            logger.error(error_msg)
             logger.error(traceback.format_exc())
             
             if retry_count < max_retries:
                 wait_time = min(30, 5 + retry_count)
-                logger.info(f"⏳ Ожидание {wait_time} секунд перед перезапуском...")
+                print(f"⏳ Ожидание {wait_time} секунд перед перезапуском...")
+                sys.stdout.flush()
                 time.sleep(wait_time)
             else:
-                logger.error(f"❌ Достигнут лимит попыток ({max_retries})")
+                print(f"❌ Достигнут лимит попыток ({max_retries})")
+                sys.stdout.flush()
                 sys.exit(1)
+    
+    print("🔴 ВЫХОЖУ ИЗ ФУНКЦИИ start_bot()")
+    sys.stdout.flush()
 
 # ================= ТОЧКА ВХОДА =================
 
 if __name__ == "__main__":
-    print("=" * 80)
-    print("🚀 Telegram Numbers Shop Bot v31.3 - УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА")
+    print("\n" + "="*80)
+    print("🔴 СТАРТ ПРОГРАММЫ")
+    print(f"Текущее время: {time.time()}")
+    print(f"PID процесса: {os.getpid()}")
+    print("="*80)
+    sys.stdout.flush()
+    
+    print("🚀 Telegram Numbers Shop Bot v31.4 - ФОРСИРОВАННАЯ ДИАГНОСТИКА")
     print("📱 3 способа пополнения: ЮMoney | Crypto Bot | Звёзды TG")
     print("✅ Админы с бесконечным балансом ♾")
     print("✅ Обязательные подписки на каналы (до 5)")
@@ -5331,7 +5425,8 @@ if __name__ == "__main__":
     print("✅ Параллельная работа веб-сервера (НЕ БЛОКИРУЕТ БОТА)")
     print("✅ УСИЛЕННАЯ ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА (3 уровня)")
     print("✅ ПЛАНОВЫЙ ПЕРЕЗАПУСК ОТКЛЮЧЕН")
-    print("=" * 80)
+    print("✅ ФОРСИРОВАННАЯ ДИАГНОСТИКА КАЖДОГО ШАГА")
+    print("="*80)
     print(f"👥 Администраторы: {ADMIN_IDS}")
     print(f"📁 Папка сессий: {SESSIONS_DIR}")
     print(f"📁 Папка бекапов: {DATABASE_BACKUP_DIR}")
@@ -5341,7 +5436,7 @@ if __name__ == "__main__":
     if RENDER_EXTERNAL_URL:
         print(f"🌐 Внешний URL: {RENDER_EXTERNAL_URL}")
         print(f"📡 UptimeRobot endpoint: {RENDER_EXTERNAL_URL}/health")
-    print("=" * 80)
+    print("="*80)
     print("⚡ СИСТЕМА 'ВЕЧНОЙ РАБОТЫ':")
     print("   • Внутренний пинг каждые 30 сек")
     print("   • Внешний самопинг каждые 45 сек")
@@ -5351,7 +5446,16 @@ if __name__ == "__main__":
     print("   • Автоперезапуск при сбоях")
     print("   • Плановый перезапуск ОТКЛЮЧЕН")
     print("   • 1000 попыток перезапуска")
-    print("=" * 80)
+    print("="*80 + "\n")
+    sys.stdout.flush()
     
-    # Запускаем бота
-    start_bot()
+    try:
+        start_bot()
+    except Exception as e:
+        print(f"❌ КРИТИЧЕСКАЯ ОШИБКА В MAIN: {e}")
+        print(traceback.format_exc())
+        sys.stdout.flush()
+        sys.exit(1)
+    
+    print("🔴 ПРОГРАММА ЗАВЕРШЕНА")
+    sys.stdout.flush()
